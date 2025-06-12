@@ -2,7 +2,6 @@
 const express = require('express');
 const bodyParser = require('body-parser');
 const { Sequelize, DataTypes } = require('sequelize');
-// Removido: const qrcode = require('qrcode'); pois não é usado neste arquivo
 // Opcional: Para validação de hash da assinatura, se a Wegate usar
 // const crypto = require('crypto'); 
 
@@ -44,9 +43,9 @@ const User = sequelize.define('User', {
         type: DataTypes.FLOAT,
         defaultValue: 0.0
     },
-     isAdmin: { // <--- ADICIONE ESTA LINHA
+    isAdmin: { // Coluna para controle de administração
         type: DataTypes.BOOLEAN,
-        defaultValue: false // Por padrão, ninguém é admin
+        defaultValue: false
     }
 }, {
     timestamps: false
@@ -82,11 +81,10 @@ Transaction.belongsTo(User, { foreignKey: 'userId' });
 // --- Sincronização do Banco de Dados ---
 // ATENÇÃO: force: true APAGA TODAS AS TABELAS A CADA INICIALIZAÇÃO.
 // USE APENAS EM AMBIENTE DE DESENVOLVIMENTO!
-sequelize.sync({ force: true })
+sequelize.sync({ force: true }) 
     .then(() => console.log('Banco de dados PostgreSQL sincronizado (webhook)!'))
     .catch(err => {
         console.error('Erro ao sincronizar o banco de dados PostgreSQL no webhook:', err);
-        // O webhook não precisa necessariamente parar o processo, pode apenas logar
     });
 
 // Endpoint para receber notificações da Wegate
@@ -97,23 +95,16 @@ app.post('/webhook/wegate-pix', async (req, res) => {
     // --- VALIDAÇÃO DO WEBHOOK (Altamente Recomendado para Segurança) ---
     // Você DEVE consultar a documentação da Wegate para saber o NOME do cabeçalho
     // que contém a assinatura e o MÉTODO EXATO de validação (ex: HMAC SHA256 do payload).
-    // Este é um exemplo simples para usar WEGATE_WEBHOOK_SECRET e remover o aviso.
-
-    // Exemplo: Supondo que a Wegate envie um cabeçalho 'x-wegate-signature'
-    // E que o secret seja uma string simples a ser comparada
     const signatureHeader = req.headers['x-wegate-signature']; // O nome exato do cabeçalho varia!
 
     if (!WEGATE_WEBHOOK_SECRET) {
         console.warn('Variável WEGATE_WEBHOOK_SECRET não configurada. A validação de webhook está desabilitada.');
-        // Pode optar por retornar 403 aqui em produção se o secret for obrigatório
     } else if (signatureHeader && signatureHeader !== WEGATE_WEBHOOK_SECRET) {
         console.warn('Webhook recebido com assinatura inválida! Possível tentativa de ataque.');
         return res.status(403).send('Forbidden: Invalid signature.');
     } else if (!signatureHeader && WEGATE_WEBHOOK_SECRET) {
         console.warn('Webhook recebido sem assinatura, mas WEGATE_WEBHOOK_SECRET está configurado. Validação parcial.');
-        // Em produção, isso pode ser um 403 também, dependendo da política
     }
-    // FIM DA VALIDAÇÃO (adapte conforme a Wegate)
 
     if (data.event === 'pix.payment.confirmed' && data.status === 'completed') {
         const referenceId = data.reference_id;
@@ -150,10 +141,8 @@ app.post('/webhook/wegate-pix', async (req, res) => {
 });
 
 // --- INICIALIZAÇÃO DO SERVIDOR WEBHOOK ---
-// Define a porta, pegando do ambiente (Railway) ou usando 8080 como fallback
 const PORT = process.env.PORT || 8080; 
 
-// Ouve na porta definida, acessível de qualquer interface de rede (0.0.0.0)
 app.listen(PORT, '0.0.0.0', () => { 
   console.log(`Servidor de webhook rodando na porta ${PORT}`);
 });

@@ -1,3 +1,4 @@
+// bot.js
 // --- Importações de Módulos ---
 require('dotenv').config(); // Carrega as variáveis de ambiente do arquivo .env
 const TelegramBot = require('node-telegram-bot-api');
@@ -51,12 +52,12 @@ const User = sequelize.define('User', {
         type: DataTypes.FLOAT,
         defaultValue: 0.0
     },
-     isAdmin: { // <--- ADICIONE ESTA LINHA
+    isAdmin: { // Coluna para controle de administração
         type: DataTypes.BOOLEAN,
         defaultValue: false // Por padrão, ninguém é admin
     }
 }, {
-    timestamps: false // Não crie colunas createdAt/updatedAt para o User, já que telegramId é PK
+    timestamps: false // Não crie colunas createdAt/updatedAt para o User
 });
 
 const Transaction = sequelize.define('Transaction', {
@@ -66,18 +67,18 @@ const Transaction = sequelize.define('Transaction', {
         primaryKey: true
     },
     type: {
-        type: DataTypes.ENUM('deposit', 'purchase', 'refund'),
+        type: DataTypes.ENUM('deposit', 'purchase', 'refund'), // Tipo da transação
         allowNull: false
     },
     amount: {
-        type: DataTypes.FLOAT,
+        type: DataTypes.FLOAT, // Valor da transação
         allowNull: false
     },
     description: {
         type: DataTypes.STRING
     },
     timestamp: {
-        type: DataTypes.DATE,
+        type: DataTypes.DATE, // Data e hora da transação
         defaultValue: DataTypes.NOW
     }
 });
@@ -87,7 +88,9 @@ User.hasMany(Transaction, { foreignKey: 'userId', onDelete: 'CASCADE' }); // Um 
 Transaction.belongsTo(User, { foreignKey: 'userId' }); // Uma transação pertence a um usuário
 
 // --- Sincronização do Banco de Dados ---
-sequelize.sync() // Cria as tabelas se elas não existirem
+// ATENÇÃO: force: true APAGA TODAS AS TABELAS A CADA INICIALIZAÇÃO.
+// USE APENAS EM AMBIENTE DE DESENVOLVIMENTO!
+sequelize.sync({ force: true }) 
     .then(() => console.log('Banco de dados PostgreSQL sincronizado (tabelas criadas/atualizadas)!'))
     .catch(err => {
         console.error('Erro ao sincronizar o banco de dados PostgreSQL:', err);
@@ -195,16 +198,10 @@ bot.onText(/\/depositar (.+)/, async (msg, match) => {
     }
 
     try {
-        // --- CHAMADA REAL PARA A API DA WEGATE PARA GERAR PIX ---
-        // ESTE É UM EXEMPLO GENÉRICO DE REQUISIÇÃO.
-        // VOCÊ PRECISA CONSULTAR A DOCUMENTAÇÃO OFICIAL DA WEGATE PARA O PAYLOAD EXATO.
         const pixPayload = {
             value: amount.toFixed(2),
             description: `Depósito para o usuário ${msg.from.username || telegramId}`,
-            reference_id: `${telegramId}-${Date.now()}`, // Um ID único para rastrear a transação
-            // receiver_key: MY_PIX_KEY, // Se a API da Wegate precisar da sua chave PIX aqui
-            // webhook_url: 'SUA_URL_DO_WEBHOOK_PARA_RECEBER_NOTIFICACOES_DA_WEGATE',
-            // ... outros parâmetros conforme a documentação da Wegate
+            reference_id: `${telegramId}-${Date.now()}`,
         };
 
         const wegateResponse = await axios.post(`${WEGATE_PIX_API_URL}/generate`, pixPayload, {
@@ -214,16 +211,13 @@ bot.onText(/\/depositar (.+)/, async (msg, match) => {
             }
         });
 
-        // Supondo que a resposta da Wegate contenha os dados do QR Code e o código Copia e Cola
-        const pixData = wegateResponse.data.qrcode_data || wegateResponse.data.qr_code_image_base64_data; // Pode ser a string PIX ou a imagem base64
-        const pixCopyPasteCode = wegateResponse.data.pix_code; // O código PIX para copiar e colar
+        const pixData = wegateResponse.data.qrcode_data || wegateResponse.data.qr_code_image_base64_data;
+        const pixCopyPasteCode = wegateResponse.data.pix_code;
 
-        // Se a Wegate retornar o QR Code já em base64, você pode usar direto.
-        // Se ela retornar a string (BR Code), você precisa gerar a imagem.
         let imageBuffer;
-        if (pixData.startsWith('data:image')) { // Já é base64
+        if (pixData.startsWith('data:image')) {
             imageBuffer = Buffer.from(pixData.replace(/^data:image\/\w+;base64,/, ""), 'base64');
-        } else { // É a string BR Code, precisa gerar o QR Code
+        } else {
             const qrCodeImageBase64 = await qrcode.toDataURL(pixData);
             imageBuffer = Buffer.from(qrCodeImageBase64.replace(/^data:image\/\w+;base64,/, ""), 'base64');
         }
@@ -234,12 +228,6 @@ bot.onText(/\/depositar (.+)/, async (msg, match) => {
                      `**Código PIX Copia e Cola:**\n\`${pixCopyPasteCode}\`\n\n` +
                      `*Importante: O saldo será creditado automaticamente após a confirmação do pagamento pela Wegate.*`
         }, { contentType: 'image/png' });
-
-        // IMPORTANTE: A atualização do saldo DEVE ser feita por um WEBHOOK da Wegate.
-        // Quando a Wegate notificar que o PIX foi pago, um endpoint do seu servidor
-        // (separado deste código do bot) deve receber essa notificação e então
-        // chamar a função updateUserBalance para creditar o saldo do usuário.
-        // Ex: `await updateUserBalance(telegramId, amount, 'deposit', 'Depósito PIX confirmado');`
 
     } catch (error) {
         console.error('Erro ao gerar PIX ou enviar QR Code:', error.message || error);
@@ -265,6 +253,48 @@ bot.onText(/\/comprar (.+) (.+)/, async (msg, match) => {
     if (!user) {
         return bot.sendMessage(chatId, 'Você ainda não está registrado. Use /registrar para criar uma conta.');
     }
+
+    let pricePerItem = 0;
+    let generateFunction;
+    let itemDescription = '';
+
+    switch (itemType) {
+        case 'gg':
+            pricePerItem = 5.0; // Preço por GG
+            generateFunction = generateGG;
+            itemDescription = 'GG';
+            break;
+        case 'card':
+        case 'cartao':
+            pricePerItem = 10.0; // Preço por cartão de teste
+            generateFunction = generateTestCreditCardData;
+            itemDescription = 'cartão de teste';
+            break;
+        default:
+            return bot.sendMessage(chatId, 'Tipo de item inválido. Escolha "gg" ou "card".');
+    }
+
+    const totalCost = quantity * pricePerItem;
+
+    // --- MODIFICAÇÃO TEMPORÁRIA PARA TESTE: DESABILITA VERIFICAÇÃO DE SALDO ---
+    if (false && user.balance < totalCost) { // 'if (false && ...)' sempre será falso, desativando a checagem
+        return bot.sendMessage(chatId, `Saldo insuficiente! Você precisa de R$ ${totalCost.toFixed(2)}, mas tem apenas R$ ${user.balance.toFixed(2)}.`);
+    }
+    // FIM DA MODIFICAÇÃO TEMPORÁRIA
+    
+    const updatedUser = await updateUserBalance(telegramId, -totalCost, 'purchase', `Compra de ${quantity} ${itemDescription}(s)`);
+
+    let generatedItems = [];
+    for (let i = 0; i < quantity; i++) {
+        generatedItems.push(generateFunction());
+    }
+
+    bot.sendMessage(chatId,
+        `Compra de ${quantity} ${itemDescription}(s) realizada com sucesso! Saldo restante: R$ ${updatedUser.balance.toFixed(2)}.\n\n` +
+        `Seus ${itemDescription}(s):\n\`\`\`\n${generatedItems.join('\n')}\n\`\`\``,
+        { parse_mode: 'Markdown' }
+    );
+});
 
 // Comando de Administrador: /setsaldo <telegramId> <valor>
 bot.onText(/\/setsaldo (.+) (.+)/, async (msg, match) => {
@@ -293,55 +323,14 @@ bot.onText(/\/setsaldo (.+) (.+)/, async (msg, match) => {
     // 4. Atualizar o saldo (usando a função updateUserBalance existente)
     try {
         const updatedUser = await updateUserBalance(targetTelegramId, amount, 'admin_adjustment', `Ajuste de saldo por admin ${adminTelegramId}`);
-        bot.sendMessage(chatId, `Saldo de <span class="math-inline">\{updatedUser\.username\} \(</span>{updatedUser.telegramId}) ajustado. Novo saldo: R$ ${updatedUser.balance.toFixed(2)}.`);
+        // LINHA CORRIGIDA: Usa template literals ` ` para a string
+        bot.sendMessage(chatId, `Saldo de ${updatedUser.username} (${updatedUser.telegramId}) ajustado. Novo saldo: R$ ${updatedUser.balance.toFixed(2)}.`);
     } catch (error) {
         console.error('Erro ao ajustar saldo por admin:', error);
         bot.sendMessage(chatId, 'Ocorreu um erro ao ajustar o saldo.');
     }
 });
 
-// ... (restante do seu código)
-
-    let pricePerItem = 0;
-    let generateFunction;
-    let itemDescription = '';
-
-    switch (itemType) {
-        case 'gg':
-            pricePerItem = 5.0; // Preço por GG
-            generateFunction = generateGG;
-            itemDescription = 'GG';
-            break;
-        case 'card':
-        case 'cartao':
-            pricePerItem = 10.0; // Preço por cartão de teste
-            generateFunction = generateTestCreditCardData;
-            itemDescription = 'cartão de teste';
-            break;
-        default:
-            return bot.sendMessage(chatId, 'Tipo de item inválido. Escolha "gg" ou "card".');
-    }
-
-    const totalCost = quantity * pricePerItem;
-
-    if (user.balance < totalCost) {
-        return bot.sendMessage(chatId, `Saldo insuficiente! Você precisa de R$ ${totalCost.toFixed(2)}, mas tem apenas R$ ${user.balance.toFixed(2)}.`);
-    }
-
-    // Desconta o valor e gera o(s) item(ns)
-    const updatedUser = await updateUserBalance(telegramId, -totalCost, 'purchase', `Compra de ${quantity} ${itemDescription}(s)`);
-
-    let generatedItems = [];
-    for (let i = 0; i < quantity; i++) {
-        generatedItems.push(generateFunction());
-    }
-
-    bot.sendMessage(chatId,
-        `Compra de ${quantity} ${itemDescription}(s) realizada com sucesso! Saldo restante: R$ ${updatedUser.balance.toFixed(2)}.\n\n` +
-        `Seus ${itemDescription}(s):\n\`\`\`\n${generatedItems.join('\n')}\n\`\`\``,
-        { parse_mode: 'Markdown' }
-    );
-});
 
 // --- Funções de Geração (GGs e Cartões de Teste) ---
 
@@ -421,3 +410,4 @@ function generateTestCreditCardData() {
 
     return `Tipo: ${randomTypeName}, Número: ${testCardNumber}, Validade: ${String(expMonth).padStart(2, '0')}/${expYear}, CVV: ${cvv} (APENAS PARA TESTES - NÃO É UM CARTÃO REAL)`;
 }
+
