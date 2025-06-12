@@ -1,0 +1,23 @@
+# Dependências
+/node_modules
+
+# Variáveis de ambiente
+.env
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Arquivos de sistema operacional
+.DS_Store
+Thumbs.db
+
+# Arquivos de IDEs (opcional, se usar VS Code, por exemplo)
+.vscode/
+.idea/
+
+# Builds de produção (se você tiver um processo de build que gera uma pasta 'dist' ou 'build')
+/dist
+/build
