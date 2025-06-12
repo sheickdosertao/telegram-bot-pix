@@ -43,6 +43,10 @@ const User = sequelize.define('User', {
     balance: {
         type: DataTypes.FLOAT,
         defaultValue: 0.0
+    },
+     isAdmin: { // <--- ADICIONE ESTA LINHA
+        type: DataTypes.BOOLEAN,
+        defaultValue: false // Por padrão, ninguém é admin
     }
 }, {
     timestamps: false

@@ -50,6 +50,10 @@ const User = sequelize.define('User', {
     balance: {
         type: DataTypes.FLOAT,
         defaultValue: 0.0
+    },
+     isAdmin: { // <--- ADICIONE ESTA LINHA
+        type: DataTypes.BOOLEAN,
+        defaultValue: false // Por padrão, ninguém é admin
     }
 }, {
     timestamps: false // Não crie colunas createdAt/updatedAt para o User, já que telegramId é PK
@@ -261,6 +265,42 @@ bot.onText(/\/comprar (.+) (.+)/, async (msg, match) => {
     if (!user) {
         return bot.sendMessage(chatId, 'Você ainda não está registrado. Use /registrar para criar uma conta.');
     }
+
+// Comando de Administrador: /setsaldo <telegramId> <valor>
+bot.onText(/\/setsaldo (.+) (.+)/, async (msg, match) => {
+    const chatId = msg.chat.id;
+    const adminTelegramId = msg.from.id;
+    const targetTelegramId = parseInt(match[1]); // ID do usuário a ser modificado
+    const amount = parseFloat(match[2]); // Valor a ser adicionado/removido
+
+    // 1. Verificar se o usuário que emitiu o comando é um admin
+    const adminUser = await User.findByPk(adminTelegramId);
+    if (!adminUser || !adminUser.isAdmin) {
+        return bot.sendMessage(chatId, 'Acesso negado. Você não tem permissão de administrador para usar este comando.');
+    }
+
+    // 2. Validar o valor
+    if (isNaN(targetTelegramId) || isNaN(amount)) {
+        return bot.sendMessage(chatId, 'Uso: /setsaldo <ID_do_usuário> <valor>. Ex: /setsaldo 123456789 100');
+    }
+
+    // 3. Encontrar o usuário alvo
+    const targetUser = await User.findByPk(targetTelegramId);
+    if (!targetUser) {
+        return bot.sendMessage(chatId, `Usuário com ID ${targetTelegramId} não encontrado.`);
+    }
+
+    // 4. Atualizar o saldo (usando a função updateUserBalance existente)
+    try {
+        const updatedUser = await updateUserBalance(targetTelegramId, amount, 'admin_adjustment', `Ajuste de saldo por admin ${adminTelegramId}`);
+        bot.sendMessage(chatId, `Saldo de <span class="math-inline">\{updatedUser\.username\} \(</span>{updatedUser.telegramId}) ajustado. Novo saldo: R$ ${updatedUser.balance.toFixed(2)}.`);
+    } catch (error) {
+        console.error('Erro ao ajustar saldo por admin:', error);
+        bot.sendMessage(chatId, 'Ocorreu um erro ao ajustar o saldo.');
+    }
+});
+
+// ... (restante do seu código)
 
     let pricePerItem = 0;
     let generateFunction;
