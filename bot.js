@@ -89,19 +89,16 @@ Transaction.belongsTo(User, { foreignKey: 'userId' }); // Uma transação perten
 
 // --- Sincronização do Banco de Dados (com alter: true para persistência) ---
 // ATENÇÃO: 'alter: true' tenta modificar a tabela existente para corresponder ao modelo.
-// Se você tem dados em tabelas existentes e adiciona/remove colunas, use 'alter: true'.
-// Se houver conflitos com ENUMs (como o erro anterior), pode precisar de limpeza manual.
+// Se houver conflitos com ENUMs (como o erro anterior), pode precisar de limpeza manual no DB.
 sequelize.sync({ alter: true }) // ALTERADO DE force: true para alter: true
     .then(() => console.log('Banco de dados PostgreSQL sincronizado (tabelas criadas/atualizadas com ALTER)!'))
     .catch(err => {
         console.error('Erro ao sincronizar o banco de dados PostgreSQL:', err);
-        // O erro 'duplicar valor da chave viola a restrição de unicidade "pg_type_typname_nsp_index"'
-        // geralmente acontece por um tipo ENUM já existente.
-        // Se este erro persistir com 'alter: true', você precisaria:
+        // Se o erro de ENUM persistir (duplicar valor da chave viola a restrição de unicidade "pg_type_typname_nsp_index"),
+        // você precisaria:
         // 1. Conectar-se ao seu DB via pgAdmin/psql.
         // 2. Executar: DROP TYPE IF EXISTS "enum_Transactions_type" CASCADE;
         // 3. Então, redeployar o bot. Isso apagaria o tipo ENUM e o Sequelize criaria um novo.
-        // É um passo avançado, mas necessário se o problema de ENUM persistir.
         process.exit(1);
     });
 
@@ -297,7 +294,8 @@ bot.onText(/\/comprar (.+) (.+)/, async (msg, match) => {
 
     for (let i = 0; i < quantity; i++) {
         const item = generateFunction();
-        const itemStatus = await checkGGStatus(itemType, item); // Passa o tipo para a função de checagem
+        // A função checkGGStatus agora fará uma chamada API (conceitual)
+        const itemStatus = await checkGGStatus(itemType, item); 
         generatedItems.push(`${item} [Status: ${itemStatus}]`); // Adiciona o status
     }
     responseMessage += `${generatedItems.join('\n')}\n\`\`\``;
@@ -371,8 +369,6 @@ bot.onText(/\/report/, async (msg) => {
         }
         reportMessage += '\n-------------------------\n';
 
-        // Você pode expandir este relatório para incluir transações por data, etc.
-        // Por exemplo, para um relatório diário de transações:
         const today = new Date();
         today.setHours(0, 0, 0, 0); // Começo do dia
         const tomorrow = new Date(today);
@@ -421,12 +417,12 @@ bot.onText(/\/report/, async (msg) => {
 // --- Funções de Geração (GGs e Cartões de Teste) ---
 
 /**
- * Gera uma 'GG' no formato NNNNNNNNNNNNNNNN|NN|NNNN|NNN.
- * Assumindo que cada segmento é uma sequência de dígitos aleatórios.
+ * Gera uma 'GG' no formato NNNNNNNNNNNNNNNN|NN|NNNN|NNN com um checksum simples.
  * Adiciona uma data de validade de 30 dias.
- * @returns {string} A GG gerada com data de validade.
+ * @returns {string} A GG gerada com data de validade e "checksum" implícito.
  */
 function generateGG() {
+    // Gerar segmentos aleatórios como antes
     const segment1 = Math.floor(Math.random() * 10**16).toString().padStart(16, '0'); // 16 dígitos
     const segment2 = Math.floor(Math.random() * 10**2).toString().padStart(2, '0');   // 2 dígitos
     const segment3 = Math.floor(Math.random() * 10**4).toString().padStart(4, '0');   // 4 dígitos
@@ -508,33 +504,85 @@ function generateTestCreditCardData() {
 }
 
 /**
- * Função mock para verificar o status de uma GG ou Card (simula uma API externa).
- * Em um cenário real, isso faria uma requisição HTTP para um verificador de GG/Card.
+ * Função para validar o formato de uma GG e simular seu status "LIVE".
+ * PRIMEIRO: Valida o formato da GG.
+ * SEGUNDO: Simula o status "LIVE" (requer API real para verificação verdadeira).
  * @param {string} itemType - Tipo do item ('gg' ou 'card').
  * @param {string} item - A GG ou o Card a ser verificado.
- * @returns {Promise<string>} O status ('LIVE', 'DIE', 'INVALID').
+ * @returns {Promise<string>} O status ('LIVE', 'DIE', 'INVALID_FORMAT', 'ERROR').
  */
 async function checkGGStatus(itemType, item) {
-    // Simulação de delay de rede
-    await new Promise(resolve => setTimeout(resolve, 500)); 
-
-    // Lógica mock de verificação de status
-    // Você pode ajustar a probabilidade ou adicionar padrões para teste
-    const randomNumber = Math.random();
+    // 1. Validação de Formato (Checksum para GGs)
     if (itemType === 'gg') {
-        if (randomNumber < 0.7) { // 70% de chance de ser LIVE
-            return 'LIVE';
-        } else if (randomNumber < 0.9) { // 20% de chance de ser DIE
-            return 'DIE';
-        } else { // 10% de chance de ser INVÁLIDO
-            return 'INVALID';
+        const ggPattern = /^(\d{16})\|(\d{2})\|(\d{4})\|(\d{3}) \(Validade: \d{2}\/\d{2}\/\d{4}\)$/;
+        if (!ggPattern.test(item)) {
+            return 'INVALID_FORMAT'; // Retorna que o formato está errado
         }
+        // Se precisar de uma lógica de checksum mais complexa para a GG (ex: soma de dígitos),
+        // ela seria implementada aqui. Por enquanto, a validação regex é o checksum de formato.
     } else if (itemType === 'card') {
-        if (randomNumber < 0.6) { // 60% de chance de ser LIVE
-            return 'LIVE';
-        } else { // 40% de chance de ser DIE
-            return 'DIE';
-        }
+        // Para cards, a validação de Luhn é feita na geração.
+        // Se precisasse validar novamente aqui, a lógica seria adicionada.
     }
-    return 'UNKNOWN'; // Tipo desconhecido
+
+    // --- EXEMPLO CONCEITUAL DE CHAMADA A UMA API EXTERNA ---
+    // ESTA PARTE AINDA É UMA SIMULAÇÃO.
+    // PARA VERIFICAÇÃO "LIVE" REAL, VOCÊ PRECISARÁ DE UMA API REAL E LEGÍTIMA.
+    const EXTERNAL_API_URL = 'https://api.exemplo.com/check-item-status'; // URL da sua API de verificação
+    const EXTERNAL_API_KEY = 'SUA_CHAVE_DA_API'; // Chave da sua API de verificação
+
+    try {
+        // Simulação de delay de rede
+        await new Promise(resolve => setTimeout(resolve, 500)); 
+
+        // EXEMPLO 1: Usando uma API que espera um POST com o item
+        /*
+        const response = await axios.post(EXTERNAL_API_URL, {
+            type: itemType,
+            itemValue: item // O item completo, incluindo validade se a API precisar
+        }, {
+            headers: {
+                'Authorization': `Bearer ${EXTERNAL_API_KEY}`,
+                'Content-Type': 'application/json'
+            }
+        });
+        return response.data.status; // Supondo que a API retorne { status: 'LIVE'/'DIE'/'INVALID' }
+        */
+
+        // EXEMPLO 2: Usando uma API que espera um GET com o item na URL
+        /*
+        const encodedItem = encodeURIComponent(item); // Codificar o item para URL
+        const response = await axios.get(`${EXTERNAL_API_URL}?type=${itemType}&item=${encodedItem}`, {
+            headers: { 'Authorization': `Bearer ${EXTERNAL_API_KEY}` }
+        });
+        return response.data.status;
+        */
+
+        // --- MOCK ATUAL (REMOVER ESTE BLOCO EM PRODUÇÃO COM API REAL) ---
+        const randomNumber = Math.random();
+        if (itemType === 'gg') {
+            if (randomNumber < 0.7) { // 70% de chance de ser LIVE
+                return 'LIVE';
+            } else if (randomNumber < 0.9) { // 20% de chance de ser DIE
+                return 'DIE';
+            } else { // 10% de chance de ser INVÁLIDO
+                return 'INVALID';
+            }
+        } else if (itemType === 'card') {
+            if (randomNumber < 0.6) { // 60% de chance de ser LIVE
+                return 'LIVE';
+            } else { // 40% de chance de ser DIE
+                return 'DIE';
+            }
+        }
+        return 'UNKNOWN'; // Tipo desconhecido
+
+    } catch (error) {
+        console.error(`Erro ao tentar verificar status do item (${itemType}):`, error.message || error);
+        if (error.response) {
+            console.error('Dados do erro da API de verificação (provavelmente mock):', error.response.data);
+        }
+        return 'ERROR'; // Retorna 'ERROR' em caso de falha na comunicação ou na API
+    }
 }
+

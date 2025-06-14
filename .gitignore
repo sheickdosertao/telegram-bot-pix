@@ -1,23 +1,21 @@
-# Dependências
-/node_modules
+# Arquivos de log e pastas de módulos
+node_modules/
+npm-debug.log
+.DS_Store
 
-# Variáveis de ambiente
+# Variáveis de ambiente (crucial!)
 .env
 
-# Logs
+# Logs e caches do ambiente
+.npm/
 *.log
-npm-debug.log*
-yarn-debug.log*
-yarn-error.log*
+*.sqlite
+/tmp/
 
-# Arquivos de sistema operacional
-.DS_Store
-Thumbs.db
-
-# Arquivos de IDEs (opcional, se usar VS Code, por exemplo)
+# Arquivos de IDE (ex: VSCode)
 .vscode/
 .idea/
 
-# Builds de produção (se você tiver um processo de build que gera uma pasta 'dist' ou 'build')
-/dist
-/build
+# Outros
+*.zip
+*.rar

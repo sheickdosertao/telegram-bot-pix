@@ -1,9 +1,11 @@
-// index.js (arquivo principal do seu projeto)
+// index.js
+// Este arquivo inicia tanto o bot do Telegram quanto o servidor de webhook.
 
-// Inicia o bot do Telegram
-require('./bot.js'); 
+// Importa e executa o bot do Telegram
+require('./bot'); 
 
-// Inicia o servidor de webhook
-require('./webhook.js'); 
+// Importa e executa o servidor de webhook
+require('./webhook');
 
-console.log('Ambos o bot e o servidor de webhook foram iniciados.');
+// Você pode adicionar logs adicionais aqui se desejar
+console.log('Ambos o bot e o servidor de webhook foram iniciados (via index.js).');
