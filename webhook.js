@@ -77,12 +77,63 @@ const Transaction = sequelize.define('Transaction', {
 User.hasMany(Transaction, { foreignKey: 'userId', onDelete: 'CASCADE' });
 Transaction.belongsTo(User, { foreignKey: 'userId' });
 
-// --- Sincronização do Banco de Dados (com alter: true para persistência) ---
-sequelize.sync({ alter: true }) // ALTERADO DE force: true para alter: true
-    .then(() => console.log('Banco de dados PostgreSQL sincronizado (webhook)!'))
-    .catch(err => {
+/**
+ * Função para garantir que o tipo ENUM 'enum_Transactions_type' existe e contém 'admin_adjustment'.
+ * Esta função tenta adicionar o valor 'admin_adjustment' se ele ainda não existir no ENUM.
+ * Isso ajuda a contornar problemas de alteração de ENUM do Sequelize.
+ */
+async function ensureEnumType() {
+    try {
+        // Verifica se o valor 'admin_adjustment' já existe no ENUM
+        const [results] = await sequelize.query(`
+            SELECT enumlabel
+            FROM pg_enum
+            WHERE enumtypid = (
+                SELECT oid FROM pg_type WHERE typname = 'enum_Transactions_type'
+            ) AND enumlabel = 'admin_adjustment';
+        `);
+
+        if (results.length === 0) {
+            // Se 'admin_adjustment' não existe, adiciona ao ENUM.
+            // A cláusula 'ADD VALUE' requer que o tipo ENUM já exista.
+            await sequelize.query(`
+                ALTER TYPE "public"."enum_Transactions_type" ADD VALUE 'admin_adjustment' AFTER 'refund';
+            `);
+            console.log('ENUM value "admin_adjustment" added to "enum_Transactions_type".');
+        } else {
+            console.log('ENUM value "admin_adjustment" already exists in "enum_Transactions_type".');
+        }
+    } catch (error) {
+        // Este catch lida com o caso em que o tipo ENUM "enum_Transactions_type" ainda não existe.
+        // O Sequelize.sync({ alter: true }) irá criá-lo depois.
+        // Ou, se houver um problema de "duplicate_object" mais profundo, o comando DROP TYPE manual é necessário.
+        console.warn('Não foi possível verificar/alterar o tipo ENUM "enum_Transactions_type" (o tipo pode não existir ainda ou outro problema):', error.message);
+    }
+}
+
+// --- Sincronização do Banco de Dados ---
+async function syncDatabase() {
+    try {
+        // Primeiro, tente garantir que o tipo ENUM esteja configurado corretamente.
+        // Isso é um passo proativo para lidar com as peculiaridades de alteração de ENUM do Sequelize.
+        await ensureEnumType();
+
+        // Em seguida, execute a operação de sincronização do Sequelize.
+        // 'alter: true' tenta modificar a tabela existente para corresponder ao modelo.
+        await sequelize.sync({ alter: true }); 
+        console.log('Banco de dados PostgreSQL sincronizado (webhook)!');
+    } catch (err) {
         console.error('Erro ao sincronizar o banco de dados PostgreSQL no webhook:', err);
-    });
+        // O erro 'duplicar valor da chave viola a restrição de unicidade "pg_type_typname_nsp_index"'
+        // geralmente acontece por um tipo ENUM já existente.
+        // Se este erro persistir, você DEVE executar manualmente:
+        // DROP TYPE IF EXISTS "enum_Transactions_type" CASCADE;
+        // no seu DB via pgAdmin/psql.
+        process.exit(1);
+    }
+}
+
+syncDatabase(); // Chama a função assíncrona para iniciar a sincronização do DB
 
 // Endpoint para receber notificações da Wegate
 app.post('/webhook/wegate-pix', async (req, res) => {
@@ -96,7 +147,7 @@ app.post('/webhook/wegate-pix', async (req, res) => {
 
     if (!WEGATE_WEBHOOK_SECRET) {
         console.warn('Variável WEGATE_WEBHOOK_SECRET não configurada. A validação de webhook está desabilitada.');
-    } else if (signatureHeader && signatureHeader !== WEGATE_WEBHOOK_SECRET) {
+    } else if (signatureHeader && signatureHeader !== WEGATE_WEBBOOK_SECRET) {
         console.warn('Webhook recebido com assinatura inválida! Possível tentativa de ataque.');
         return res.status(403).send('Forbidden: Invalid signature.');
     } else if (!signatureHeader && WEGATE_WEBHOOK_SECRET) {

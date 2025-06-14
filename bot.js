@@ -87,20 +87,63 @@ const Transaction = sequelize.define('Transaction', {
 User.hasMany(Transaction, { foreignKey: 'userId', onDelete: 'CASCADE' }); // Um usuário tem muitas transações
 Transaction.belongsTo(User, { foreignKey: 'userId' }); // Uma transação pertence a um usuário
 
-// --- Sincronização do Banco de Dados (com alter: true para persistência) ---
-// ATENÇÃO: 'alter: true' tenta modificar a tabela existente para corresponder ao modelo.
-// Se houver conflitos com ENUMs (como o erro anterior), pode precisar de limpeza manual no DB.
-sequelize.sync({ alter: true }) // ALTERADO DE force: true para alter: true
-    .then(() => console.log('Banco de dados PostgreSQL sincronizado (tabelas criadas/atualizadas com ALTER)!'))
-    .catch(err => {
+/**
+ * Função para garantir que o tipo ENUM 'enum_Transactions_type' existe e contém 'admin_adjustment'.
+ * Esta função tenta adicionar o valor 'admin_adjustment' se ele ainda não existir no ENUM.
+ * Isso ajuda a contornar problemas de alteração de ENUM do Sequelize.
+ */
+async function ensureEnumType() {
+    try {
+        // Verifica se o valor 'admin_adjustment' já existe no ENUM
+        const [results] = await sequelize.query(`
+            SELECT enumlabel
+            FROM pg_enum
+            WHERE enumtypid = (
+                SELECT oid FROM pg_type WHERE typname = 'enum_Transactions_type'
+            ) AND enumlabel = 'admin_adjustment';
+        `);
+
+        if (results.length === 0) {
+            // Se 'admin_adjustment' não existe, adiciona ao ENUM.
+            // A cláusula 'ADD VALUE' requer que o tipo ENUM já exista.
+            await sequelize.query(`
+                ALTER TYPE "public"."enum_Transactions_type" ADD VALUE 'admin_adjustment' AFTER 'refund';
+            `);
+            console.log('ENUM value "admin_adjustment" added to "enum_Transactions_type".');
+        } else {
+            console.log('ENUM value "admin_adjustment" already exists in "enum_Transactions_type".');
+        }
+    } catch (error) {
+        // Este catch lida com o caso em que o tipo ENUM "enum_Transactions_type" ainda não existe.
+        // O Sequelize.sync({ alter: true }) irá criá-lo depois.
+        // Ou, se houver um problema de "duplicate_object" mais profundo, o comando DROP TYPE manual é necessário.
+        console.warn('Não foi possível verificar/alterar o tipo ENUM "enum_Transactions_type" (o tipo pode não existir ainda ou outro problema):', error.message);
+    }
+}
+
+// --- Sincronização do Banco de Dados ---
+async function syncDatabase() {
+    try {
+        // Primeiro, tente garantir que o tipo ENUM esteja configurado corretamente.
+        // Isso é um passo proativo para lidar com as peculiaridades de alteração de ENUM do Sequelize.
+        await ensureEnumType();
+
+        // Em seguida, execute a operação de sincronização do Sequelize.
+        // 'alter: true' tenta modificar a tabela existente para corresponder ao modelo.
+        await sequelize.sync({ alter: true }); 
+        console.log('Banco de dados PostgreSQL sincronizado (tabelas criadas/atualizadas com ALTER)!');
+    } catch (err) {
         console.error('Erro ao sincronizar o banco de dados PostgreSQL:', err);
-        // Se o erro de ENUM persistir (duplicar valor da chave viola a restrição de unicidade "pg_type_typname_nsp_index"),
-        // você precisaria:
-        // 1. Conectar-se ao seu DB via pgAdmin/psql.
-        // 2. Executar: DROP TYPE IF EXISTS "enum_Transactions_type" CASCADE;
-        // 3. Então, redeployar o bot. Isso apagaria o tipo ENUM e o Sequelize criaria um novo.
+        // O erro 'duplicar valor da chave viola a restrição de unicidade "pg_type_typname_nsp_index"'
+        // geralmente acontece por um tipo ENUM já existente.
+        // Se este erro persistir, você DEVE executar manualmente:
+        // DROP TYPE IF EXISTS "enum_Transactions_type" CASCADE;
+        // no seu DB via pgAdmin/psql.
         process.exit(1);
-    });
+    }
+}
+
+syncDatabase(); // Chama a função assíncrona para iniciar a sincronização do DB
 
 
 // --- Funções de Ajuda do Banco de Dados ---
@@ -294,7 +337,6 @@ bot.onText(/\/comprar (.+) (.+)/, async (msg, match) => {
 
     for (let i = 0; i < quantity; i++) {
         const item = generateFunction();
-        // A função checkGGStatus agora fará uma chamada API (conceitual)
         const itemStatus = await checkGGStatus(itemType, item); 
         generatedItems.push(`${item} [Status: ${itemStatus}]`); // Adiciona o status
     }
