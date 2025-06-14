@@ -2,7 +2,7 @@
 // --- Importações de Módulos ---
 require('dotenv').config(); // Carrega as variáveis de ambiente do arquivo .env
 const TelegramBot = require('node-telegram-bot-api');
-const { Sequelize, DataTypes } = require('sequelize'); // Importa Sequelize e DataTypes
+const { Sequelize, DataTypes, Op } = require('sequelize'); // Importa Sequelize, DataTypes e Op para operações de consulta
 const axios = require('axios'); // Para fazer requisições HTTP (API da Wegate)
 const qrcode = require('qrcode'); // Para gerar QR Codes
 
@@ -67,7 +67,7 @@ const Transaction = sequelize.define('Transaction', {
         primaryKey: true
     },
     type: {
-        type: DataTypes.ENUM('deposit', 'purchase', 'refund'), // Tipo da transação
+        type: DataTypes.ENUM('deposit', 'purchase', 'refund', 'admin_adjustment'), // Adicionado 'admin_adjustment'
         allowNull: false
     },
     amount: {
@@ -87,15 +87,24 @@ const Transaction = sequelize.define('Transaction', {
 User.hasMany(Transaction, { foreignKey: 'userId', onDelete: 'CASCADE' }); // Um usuário tem muitas transações
 Transaction.belongsTo(User, { foreignKey: 'userId' }); // Uma transação pertence a um usuário
 
-// --- Sincronização do Banco de Dados ---
-// ATENÇÃO: force: true APAGA TODAS AS TABELAS A CADA INICIALIZAÇÃO.
-// USE APENAS EM AMBIENTE DE DESENVOLVIMENTO!
-sequelize.sync({ force: true }) 
-    .then(() => console.log('Banco de dados PostgreSQL sincronizado (tabelas criadas/atualizadas)!'))
+// --- Sincronização do Banco de Dados (com alter: true para persistência) ---
+// ATENÇÃO: 'alter: true' tenta modificar a tabela existente para corresponder ao modelo.
+// Se você tem dados em tabelas existentes e adiciona/remove colunas, use 'alter: true'.
+// Se houver conflitos com ENUMs (como o erro anterior), pode precisar de limpeza manual.
+sequelize.sync({ alter: true }) // ALTERADO DE force: true para alter: true
+    .then(() => console.log('Banco de dados PostgreSQL sincronizado (tabelas criadas/atualizadas com ALTER)!'))
     .catch(err => {
         console.error('Erro ao sincronizar o banco de dados PostgreSQL:', err);
+        // O erro 'duplicar valor da chave viola a restrição de unicidade "pg_type_typname_nsp_index"'
+        // geralmente acontece por um tipo ENUM já existente.
+        // Se este erro persistir com 'alter: true', você precisaria:
+        // 1. Conectar-se ao seu DB via pgAdmin/psql.
+        // 2. Executar: DROP TYPE IF EXISTS "enum_Transactions_type" CASCADE;
+        // 3. Então, redeployar o bot. Isso apagaria o tipo ENUM e o Sequelize criaria um novo.
+        // É um passo avançado, mas necessário se o problema de ENUM persistir.
         process.exit(1);
     });
+
 
 // --- Funções de Ajuda do Banco de Dados ---
 
@@ -122,7 +131,7 @@ async function findOrCreateUser(telegramId, username) {
  * Atualiza o saldo do usuário e registra uma transação.
  * @param {number} telegramId - ID do Telegram do usuário.
  * @param {number} amount - Valor a ser adicionado (positivo) ou subtraído (negativo).
- * @param {string} type - Tipo da transação ('deposit', 'purchase', 'refund').
+ * @param {string} type - Tipo da transação ('deposit', 'purchase', 'refund', 'admin_adjustment').
  * @param {string} description - Descrição da transação.
  * @returns {Promise<Model>} O modelo do usuário atualizado.
  */
@@ -276,24 +285,24 @@ bot.onText(/\/comprar (.+) (.+)/, async (msg, match) => {
 
     const totalCost = quantity * pricePerItem;
 
-    // --- MODIFICAÇÃO TEMPORÁRIA PARA TESTE: DESABILITA VERIFICAÇÃO DE SALDO ---
-    if (false && user.balance < totalCost) { // 'if (false && ...)' sempre será falso, desativando a checagem
+    if (user.balance < totalCost) {
         return bot.sendMessage(chatId, `Saldo insuficiente! Você precisa de R$ ${totalCost.toFixed(2)}, mas tem apenas R$ ${user.balance.toFixed(2)}.`);
     }
-    // FIM DA MODIFICAÇÃO TEMPORÁRIA
     
     const updatedUser = await updateUserBalance(telegramId, -totalCost, 'purchase', `Compra de ${quantity} ${itemDescription}(s)`);
 
     let generatedItems = [];
-    for (let i = 0; i < quantity; i++) {
-        generatedItems.push(generateFunction());
-    }
+    let responseMessage = `Compra de ${quantity} ${itemDescription}(s) realizada com sucesso! Saldo restante: R$ ${updatedUser.balance.toFixed(2)}.\n\n`;
+    responseMessage += `Seus ${itemDescription}(s):\n\`\`\`\n`;
 
-    bot.sendMessage(chatId,
-        `Compra de ${quantity} ${itemDescription}(s) realizada com sucesso! Saldo restante: R$ ${updatedUser.balance.toFixed(2)}.\n\n` +
-        `Seus ${itemDescription}(s):\n\`\`\`\n${generatedItems.join('\n')}\n\`\`\``,
-        { parse_mode: 'Markdown' }
-    );
+    for (let i = 0; i < quantity; i++) {
+        const item = generateFunction();
+        const itemStatus = await checkGGStatus(itemType, item); // Passa o tipo para a função de checagem
+        generatedItems.push(`${item} [Status: ${itemStatus}]`); // Adiciona o status
+    }
+    responseMessage += `${generatedItems.join('\n')}\n\`\`\``;
+
+    bot.sendMessage(chatId, responseMessage, { parse_mode: 'Markdown' });
 });
 
 // Comando de Administrador: /setsaldo <telegramId> <valor>
@@ -323,11 +332,88 @@ bot.onText(/\/setsaldo (.+) (.+)/, async (msg, match) => {
     // 4. Atualizar o saldo (usando a função updateUserBalance existente)
     try {
         const updatedUser = await updateUserBalance(targetTelegramId, amount, 'admin_adjustment', `Ajuste de saldo por admin ${adminTelegramId}`);
-        // LINHA CORRIGIDA: Usa template literals ` ` para a string
         bot.sendMessage(chatId, `Saldo de ${updatedUser.username} (${updatedUser.telegramId}) ajustado. Novo saldo: R$ ${updatedUser.balance.toFixed(2)}.`);
     } catch (error) {
         console.error('Erro ao ajustar saldo por admin:', error);
         bot.sendMessage(chatId, 'Ocorreu um erro ao ajustar o saldo.');
+    }
+});
+
+// Comando de Administrador: /report
+bot.onText(/\/report/, async (msg) => {
+    const chatId = msg.chat.id;
+    const adminTelegramId = msg.from.id;
+
+    // 1. Verificar se o usuário que emitiu o comando é um admin
+    const adminUser = await User.findByPk(adminTelegramId);
+    if (!adminUser || !adminUser.isAdmin) {
+        return bot.sendMessage(chatId, 'Acesso negado. Você não tem permissão de administrador para usar este comando.');
+    }
+
+    try {
+        const users = await User.findAll({
+            order: [['balance', 'DESC']], // Ordena por saldo decrescente
+        });
+
+        let reportMessage = '📊 **Relatório de Saldo de Usuários** 📊\n\n';
+        reportMessage += `Total de Usuários: ${users.length}\n\n`;
+        reportMessage += '--- Saldo por Usuário ---\n';
+
+        if (users.length === 0) {
+            reportMessage += 'Nenhum usuário registrado ainda.\n';
+        } else {
+            for (const user of users) {
+                reportMessage += `\nID: ${user.telegramId}\n`;
+                reportMessage += `Username: ${user.username}\n`;
+                reportMessage += `Saldo: R$ ${user.balance.toFixed(2)}\n`;
+                reportMessage += `Admin: ${user.isAdmin ? 'Sim' : 'Não'}\n`;
+            }
+        }
+        reportMessage += '\n-------------------------\n';
+
+        // Você pode expandir este relatório para incluir transações por data, etc.
+        // Por exemplo, para um relatório diário de transações:
+        const today = new Date();
+        today.setHours(0, 0, 0, 0); // Começo do dia
+        const tomorrow = new Date(today);
+        tomorrow.setDate(today.getDate() + 1); // Fim do dia
+
+        const dailyTransactions = await Transaction.findAll({
+            where: {
+                timestamp: {
+                    [Op.gte]: today,
+                    [Op.lt]: tomorrow,
+                },
+            },
+            include: [{
+                model: User,
+                attributes: ['telegramId', 'username']
+            }],
+            order: [['timestamp', 'ASC']],
+        });
+
+        reportMessage += `📅 **Transações de Hoje (${today.toLocaleDateString('pt-BR')})** 📅\n`;
+        if (dailyTransactions.length === 0) {
+            reportMessage += 'Nenhuma transação registrada hoje.\n';
+        } else {
+            for (const transaction of dailyTransactions) {
+                const username = transaction.User ? transaction.User.username : 'Desconhecido';
+                reportMessage += `\nUsuário: ${username} (ID: ${transaction.userId})\n`;
+                reportMessage += `Tipo: ${transaction.type}\n`;
+                reportMessage += `Valor: R$ ${transaction.amount.toFixed(2)}\n`;
+                reportMessage += `Descrição: ${transaction.description || 'N/A'}\n`;
+                reportMessage += `Hora: ${new Date(transaction.timestamp).toLocaleTimeString('pt-BR')}\n`;
+            }
+        }
+        reportMessage += '\n-------------------------\n';
+        reportMessage += 'Relatório gerado em: ' + new Date().toLocaleString('pt-BR');
+
+
+        bot.sendMessage(chatId, reportMessage, { parse_mode: 'Markdown' });
+
+    } catch (error) {
+        console.error('Erro ao gerar relatório de saldo:', error);
+        bot.sendMessage(chatId, 'Ocorreu um erro ao gerar o relatório. Por favor, tente novamente mais tarde.');
     }
 });
 
@@ -337,14 +423,24 @@ bot.onText(/\/setsaldo (.+) (.+)/, async (msg, match) => {
 /**
  * Gera uma 'GG' no formato NNNNNNNNNNNNNNNN|NN|NNNN|NNN.
  * Assumindo que cada segmento é uma sequência de dígitos aleatórios.
- * @returns {string} A GG gerada.
+ * Adiciona uma data de validade de 30 dias.
+ * @returns {string} A GG gerada com data de validade.
  */
 function generateGG() {
     const segment1 = Math.floor(Math.random() * 10**16).toString().padStart(16, '0'); // 16 dígitos
     const segment2 = Math.floor(Math.random() * 10**2).toString().padStart(2, '0');   // 2 dígitos
     const segment3 = Math.floor(Math.random() * 10**4).toString().padStart(4, '0');   // 4 dígitos
     const segment4 = Math.floor(Math.random() * 10**3).toString().padStart(3, '0');   // 3 dígitos
-    return `${segment1}|${segment2}|${segment3}|${segment4}`;
+    
+    // Data de validade (ex: 30 dias a partir de agora)
+    const expiryDate = new Date();
+    expiryDate.setDate(expiryDate.getDate() + 30);
+    const day = String(expiryDate.getDate()).padStart(2, '0');
+    const month = String(expiryDate.getMonth() + 1).padStart(2, '0'); // Mês é 0-indexed
+    const year = expiryDate.getFullYear();
+    const formattedExpiryDate = `${day}/${month}/${year}`;
+
+    return `${segment1}|${segment2}|${segment3}|${segment4} (Validade: ${formattedExpiryDate})`;
 }
 
 
@@ -411,3 +507,34 @@ function generateTestCreditCardData() {
     return `Tipo: ${randomTypeName}, Número: ${testCardNumber}, Validade: ${String(expMonth).padStart(2, '0')}/${expYear}, CVV: ${cvv} (APENAS PARA TESTES - NÃO É UM CARTÃO REAL)`;
 }
 
+/**
+ * Função mock para verificar o status de uma GG ou Card (simula uma API externa).
+ * Em um cenário real, isso faria uma requisição HTTP para um verificador de GG/Card.
+ * @param {string} itemType - Tipo do item ('gg' ou 'card').
+ * @param {string} item - A GG ou o Card a ser verificado.
+ * @returns {Promise<string>} O status ('LIVE', 'DIE', 'INVALID').
+ */
+async function checkGGStatus(itemType, item) {
+    // Simulação de delay de rede
+    await new Promise(resolve => setTimeout(resolve, 500)); 
+
+    // Lógica mock de verificação de status
+    // Você pode ajustar a probabilidade ou adicionar padrões para teste
+    const randomNumber = Math.random();
+    if (itemType === 'gg') {
+        if (randomNumber < 0.7) { // 70% de chance de ser LIVE
+            return 'LIVE';
+        } else if (randomNumber < 0.9) { // 20% de chance de ser DIE
+            return 'DIE';
+        } else { // 10% de chance de ser INVÁLIDO
+            return 'INVALID';
+        }
+    } else if (itemType === 'card') {
+        if (randomNumber < 0.6) { // 60% de chance de ser LIVE
+            return 'LIVE';
+        } else { // 40% de chance de ser DIE
+            return 'DIE';
+        }
+    }
+    return 'UNKNOWN'; // Tipo desconhecido
+}

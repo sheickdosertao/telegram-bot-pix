@@ -2,8 +2,7 @@
 const express = require('express');
 const bodyParser = require('body-parser');
 const { Sequelize, DataTypes } = require('sequelize');
-// Opcional: Para validação de hash da assinatura, se a Wegate usar
-// const crypto = require('crypto'); 
+// Opcional: const crypto = require('crypto'); // Para validação de hash da assinatura, se a Wegate usar
 
 // --- Variáveis de Configuração (Lidas de Variáveis de Ambiente) ---
 require('dotenv').config();
@@ -58,7 +57,7 @@ const Transaction = sequelize.define('Transaction', {
         primaryKey: true
     },
     type: {
-        type: DataTypes.ENUM('deposit', 'purchase', 'refund'),
+        type: DataTypes.ENUM('deposit', 'purchase', 'refund', 'admin_adjustment'), // Adicionado 'admin_adjustment'
         allowNull: false
     },
     amount: {
@@ -78,10 +77,8 @@ const Transaction = sequelize.define('Transaction', {
 User.hasMany(Transaction, { foreignKey: 'userId', onDelete: 'CASCADE' });
 Transaction.belongsTo(User, { foreignKey: 'userId' });
 
-// --- Sincronização do Banco de Dados ---
-// ATENÇÃO: force: true APAGA TODAS AS TABELAS A CADA INICIALIZAÇÃO.
-// USE APENAS EM AMBIENTE DE DESENVOLVIMENTO!
-sequelize.sync({ force: true }) 
+// --- Sincronização do Banco de Dados (com alter: true para persistência) ---
+sequelize.sync({ alter: true }) // ALTERADO DE force: true para alter: true
     .then(() => console.log('Banco de dados PostgreSQL sincronizado (webhook)!'))
     .catch(err => {
         console.error('Erro ao sincronizar o banco de dados PostgreSQL no webhook:', err);
