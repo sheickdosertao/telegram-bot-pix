@@ -6,9 +6,9 @@ const crypto = require('crypto'); // Para validação de hash da assinatura
 // --- Variáveis de Configuração (Lidas de Variáveis de Ambiente) ---
 require('dotenv').config();
 const DATABASE_URL = process.env.DATABASE_URL;
-const PAGSEGURO_WEBHOOK_SECRET = process.env.PAGSEGURO_WEBHOOK_SECRET; 
-const PAGSEGURO_TOKEN = process.env.PAGSEGURO_TOKEN;
-
+const PAGSEGURO_WEBHOOK_SECRET = process.env.PAGSEGURO_WEBHOOK_SECRET;
+const PAGBANK_API_TOKEN = process.env.PAGBANK_API_TOKEN;
+const PAGBANK_EMAIL = process.env.PAGBANK_EMAIL;
 const app = express();
 
 // Middleware para capturar o body raw (necessário para validação de assinatura)
@@ -196,7 +196,7 @@ app.post('/webhook/pagseguro', async (req, res) => {
 async function processPagSeguroNotification(notificationCode, res) {
     try {
         // Consulta a API do PagSeguro para obter detalhes da transação
-        const response = await fetch(`https://ws.pagseguro.uol.com.br/v3/transactions/notifications/${notificationCode}?email=${process.env.PAGSEGURO_EMAIL}&token=${PAGSEGURO_TOKEN}`);
+        const response = await fetch(`https://ws.pagseguro.uol.com.br/v3/transactions/notifications/${notificationCode}?email=${process.env.PAGBANK_EMAIL}&token=${PAGBANK_API_TOKEN}`);
         
         if (!response.ok) {
             throw new Error(`Erro na API do PagSeguro: ${response.status}`);
