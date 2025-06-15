@@ -1,17 +1,20 @@
 // webhook.js
 const express = require('express');
-const bodyParser = require('body-parser');
 const { Sequelize, DataTypes } = require('sequelize');
-// Opcional: const crypto = require('crypto'); // Para validação de hash da assinatura, se a Wegate usar
+const crypto = require('crypto'); // Para validação de hash da assinatura
 
 // --- Variáveis de Configuração (Lidas de Variáveis de Ambiente) ---
 require('dotenv').config();
 const DATABASE_URL = process.env.DATABASE_URL;
-const WEGATE_WEBHOOK_SECRET = process.env.WEGATE_WEBHOOK_SECRET; 
+const PAGSEGURO_WEBHOOK_SECRET = process.env.PAGSEGURO_WEBHOOK_SECRET; 
+const PAGSEGURO_TOKEN = process.env.PAGSEGURO_TOKEN;
 
 const app = express();
-// Certifique-se de que bodyParser.json() vem antes das rotas que o usam
-app.use(bodyParser.json());
+
+// Middleware para capturar o body raw (necessário para validação de assinatura)
+app.use('/webhook', express.raw({ type: 'application/json' }));
+// Para outras rotas, use JSON parser normal
+app.use(express.json());
 
 // --- Conexão PostgreSQL com Sequelize ---
 const sequelize = new Sequelize(DATABASE_URL, {
@@ -57,7 +60,7 @@ const Transaction = sequelize.define('Transaction', {
         primaryKey: true
     },
     type: {
-        type: DataTypes.ENUM('deposit', 'purchase', 'refund', 'admin_adjustment'), // Adicionado 'admin_adjustment'
+        type: DataTypes.ENUM('deposit', 'purchase', 'refund', 'admin_adjustment'),
         allowNull: false
     },
     amount: {
@@ -79,12 +82,9 @@ Transaction.belongsTo(User, { foreignKey: 'userId' });
 
 /**
  * Função para garantir que o tipo ENUM 'enum_Transactions_type' existe e contém 'admin_adjustment'.
- * Esta função tenta adicionar o valor 'admin_adjustment' se ele ainda não existir no ENUM.
- * Isso ajuda a contornar problemas de alteração de ENUM do Sequelize.
  */
 async function ensureEnumType() {
     try {
-        // Verifica se o valor 'admin_adjustment' já existe no ENUM
         const [results] = await sequelize.query(`
             SELECT enumlabel
             FROM pg_enum
@@ -94,8 +94,6 @@ async function ensureEnumType() {
         `);
 
         if (results.length === 0) {
-            // Se 'admin_adjustment' não existe, adiciona ao ENUM.
-            // A cláusula 'ADD VALUE' requer que o tipo ENUM já exista.
             await sequelize.query(`
                 ALTER TYPE "public"."enum_Transactions_type" ADD VALUE 'admin_adjustment' AFTER 'refund';
             `);
@@ -104,93 +102,247 @@ async function ensureEnumType() {
             console.log('ENUM value "admin_adjustment" already exists in "enum_Transactions_type".');
         }
     } catch (error) {
-        // Este catch lida com o caso em que o tipo ENUM "enum_Transactions_type" ainda não existe.
-        // O Sequelize.sync({ alter: true }) irá criá-lo depois.
-        // Ou, se houver um problema de "duplicate_object" mais profundo, o comando DROP TYPE manual é necessário.
-        console.warn('Não foi possível verificar/alterar o tipo ENUM "enum_Transactions_type" (o tipo pode não existir ainda ou outro problema):', error.message);
+        console.warn('Não foi possível verificar/alterar o tipo ENUM "enum_Transactions_type":', error.message);
     }
+}
+
+/**
+ * Função para validar a assinatura do webhook do PagSeguro
+ * @param {Buffer} payload - Body raw da requisição
+ * @param {string} signature - Assinatura recebida no header
+ * @param {string} secret - Secret configurado no PagSeguro
+ * @returns {boolean} - True se a assinatura for válida
+ */
+function validatePagSeguroSignature(payload, signature, secret) {
+    if (!signature || !secret) {
+        return false;
+    }
+
+    // Remove o prefixo se existir (ex: "sha256=")
+    const cleanSignature = signature.replace(/^sha256=/, '');
+    
+    // Gera o hash esperado usando HMAC SHA256
+    const expectedSignature = crypto
+        .createHmac('sha256', secret)
+        .update(payload)
+        .digest('hex');
+
+    // Compara as assinaturas de forma segura
+    return crypto.timingSafeEqual(
+        Buffer.from(cleanSignature, 'hex'),
+        Buffer.from(expectedSignature, 'hex')
+    );
 }
 
 // --- Sincronização do Banco de Dados ---
 async function syncDatabase() {
     try {
-        // Primeiro, tente garantir que o tipo ENUM esteja configurado corretamente.
-        // Isso é um passo proativo para lidar com as peculiaridades de alteração de ENUM do Sequelize.
         await ensureEnumType();
-
-        // Em seguida, execute a operação de sincronização do Sequelize.
-        // 'alter: true' tenta modificar a tabela existente para corresponder ao modelo.
         await sequelize.sync({ alter: true }); 
         console.log('Banco de dados PostgreSQL sincronizado (webhook)!');
     } catch (err) {
         console.error('Erro ao sincronizar o banco de dados PostgreSQL no webhook:', err);
-        // O erro 'duplicar valor da chave viola a restrição de unicidade "pg_type_typname_nsp_index"'
-        // geralmente acontece por um tipo ENUM já existente.
-        // Se este erro persistir, você DEVE executar manualmente:
-        // DROP TYPE IF EXISTS "enum_Transactions_type" CASCADE;
-        // no seu DB via pgAdmin/psql.
         process.exit(1);
     }
 }
 
-syncDatabase(); // Chama a função assíncrona para iniciar a sincronização do DB
+syncDatabase();
 
-// Endpoint para receber notificações da Wegate
-app.post('/webhook/wegate-pix', async (req, res) => {
-    const data = req.body;
-    console.log('Webhook da Wegate recebido:', data);
+// Endpoint para receber notificações do PagSeguro
+app.post('/webhook/pagseguro', async (req, res) => {
+    try {
+        // Parse do JSON do body raw
+        const data = JSON.parse(req.body.toString());
+        console.log('Webhook do PagSeguro recebido:', data);
 
-    // --- VALIDAÇÃO DO WEBHOOK (Altamente Recomendado para Segurança) ---
-    // Você DEVE consultar a documentação da Wegate para saber o NOME do cabeçalho
-    // que contém a assinatura e o MÉTODO EXATO de validação (ex: HMAC SHA256 do payload).
-    const signatureHeader = req.headers['x-wegate-signature']; // O nome exato do cabeçalho varia!
+        // --- VALIDAÇÃO DO WEBHOOK (Altamente Recomendado para Segurança) ---
+        const signatureHeader = req.headers['x-pagseguro-signature'] || req.headers['x-signature'];
 
-    if (!WEGATE_WEBHOOK_SECRET) {
-        console.warn('Variável WEGATE_WEBHOOK_SECRET não configurada. A validação de webhook está desabilitada.');
-    } else if (signatureHeader && signatureHeader !== WEGATE_WEBBOOK_SECRET) {
-        console.warn('Webhook recebido com assinatura inválida! Possível tentativa de ataque.');
-        return res.status(403).send('Forbidden: Invalid signature.');
-    } else if (!signatureHeader && WEGATE_WEBHOOK_SECRET) {
-        console.warn('Webhook recebido sem assinatura, mas WEGATE_WEBHOOK_SECRET está configurado. Validação parcial.');
-    }
-
-    if (data.event === 'pix.payment.confirmed' && data.status === 'completed') {
-        const referenceId = data.reference_id;
-        const telegramId = parseInt(referenceId.split('-')[0]);
-        const amount = parseFloat(data.amount);
-
-        if (!isNaN(telegramId) && !isNaN(amount) && amount > 0) {
-            try {
-                const user = await User.findByPk(telegramId);
-                if (user) {
-                    await user.increment('balance', { by: amount });
-                    await Transaction.create({
-                        userId: telegramId,
-                        amount: amount,
-                        type: 'deposit',
-                        description: `Depósito PIX confirmado (Ref: ${referenceId})`
-                    });
-                    console.log(`PIX confirmado para usuário ${telegramId}. Saldo atualizado para: ${user.balance + amount}`);
-                } else {
-                    console.warn(`Usuário ${telegramId} não encontrado no DB para confirmação de PIX (Ref: ${referenceId}).`);
-                }
-                res.status(200).send('Webhook recebido e processado.');
-            } catch (error) {
-                console.error('Erro ao processar atualização do saldo via webhook:', error);
-                res.status(500).send('Erro interno do servidor ao processar webhook.');
+        if (!PAGSEGURO_WEBHOOK_SECRET) {
+            console.warn('Variável PAGSEGURO_WEBHOOK_SECRET não configurada. A validação de webhook está desabilitada.');
+        } else if (signatureHeader) {
+            const isValidSignature = validatePagSeguroSignature(req.body, signatureHeader, PAGSEGURO_WEBHOOK_SECRET);
+            if (!isValidSignature) {
+                console.warn('Webhook recebido com assinatura inválida! Possível tentativa de ataque.');
+                return res.status(403).json({ error: 'Forbidden: Invalid signature' });
             }
-        } else {
-            console.warn('Dados inválidos ou incompletos no webhook da Wegate:', data);
-            res.status(400).send('Dados inválidos no webhook.');
+            console.log('Assinatura do webhook validada com sucesso.');
+        } else if (PAGSEGURO_WEBHOOK_SECRET) {
+            console.warn('Webhook recebido sem assinatura, mas PAGSEGURO_WEBHOOK_SECRET está configurado.');
+            return res.status(403).json({ error: 'Forbidden: Missing signature' });
         }
-    } else {
-        res.status(200).send('Evento não relevante ou status não final.');
+
+        // Processa diferentes tipos de eventos do PagSeguro
+        if (data.notificationCode) {
+            // Webhook de notificação tradicional do PagSeguro
+            await processPagSeguroNotification(data.notificationCode, res);
+        } else if (data.charges && data.charges.length > 0) {
+            // Webhook do PagSeguro V4 (novo formato)
+            await processPagSeguroV4Webhook(data, res);
+        } else {
+            console.log('Formato de webhook não reconhecido:', data);
+            res.status(200).json({ message: 'Webhook recebido mas não processado' });
+        }
+
+    } catch (parseError) {
+        console.error('Erro ao fazer parse do JSON do webhook:', parseError);
+        res.status(400).json({ error: 'JSON inválido' });
     }
 });
 
-// --- INICIALIZAÇÃO DO SERVIDOR WEBHOOK ---
-const PORT = process.env.PORT || 8080; 
+/**
+ * Processa webhook tradicional do PagSeguro (V3)
+ */
+async function processPagSeguroNotification(notificationCode, res) {
+    try {
+        // Consulta a API do PagSeguro para obter detalhes da transação
+        const response = await fetch(`https://ws.pagseguro.uol.com.br/v3/transactions/notifications/${notificationCode}?email=${process.env.PAGSEGURO_EMAIL}&token=${PAGSEGURO_TOKEN}`);
+        
+        if (!response.ok) {
+            throw new Error(`Erro na API do PagSeguro: ${response.status}`);
+        }
 
-app.listen(PORT, '0.0.0.0', () => { 
-  console.log(`Servidor de webhook rodando na porta ${PORT}`);
+        const xmlData = await response.text();
+        console.log('Dados XML recebidos do PagSeguro:', xmlData);
+
+        // Aqui você precisaria fazer o parse do XML
+        // Para simplificar, vou mostrar como seria com a estrutura esperada
+        const transactionData = parseXMLTransaction(xmlData);
+        
+        if (transactionData.status === 3 || transactionData.status === 4) { // Status 3 = Paga, 4 = Disponível
+            await processPayment(transactionData, res);
+        } else {
+            console.log(`Transação ${transactionData.code} ainda não foi paga. Status: ${transactionData.status}`);
+            res.status(200).json({ message: 'Transação não paga ainda' });
+        }
+
+    } catch (error) {
+        console.error('Erro ao processar notificação do PagSeguro:', error);
+        res.status(500).json({ error: 'Erro ao processar notificação' });
+    }
+}
+
+/**
+ * Processa webhook do PagSeguro V4 (novo formato)
+ */
+async function processPagSeguroV4Webhook(data, res) {
+    try {
+        const charge = data.charges[0]; // Primeira cobrança
+        
+        if (charge.status === 'PAID') {
+            const referenceId = charge.reference_id;
+            const amount = parseFloat(charge.amount.value) / 100; // PagSeguro envia em centavos
+
+            await processPaymentFromReference(referenceId, amount, charge.id, res);
+        } else {
+            console.log(`Cobrança ${charge.id} ainda não foi paga. Status: ${charge.status}`);
+            res.status(200).json({ message: 'Cobrança não paga ainda' });
+        }
+
+    } catch (error) {
+        console.error('Erro ao processar webhook V4 do PagSeguro:', error);
+        res.status(500).json({ error: 'Erro ao processar webhook V4' });
+    }
+}
+
+/**
+ * Processa o pagamento baseado no reference_id
+ */
+async function processPaymentFromReference(referenceId, amount, transactionId, res) {
+    try {
+        // Valida se reference_id tem o formato esperado
+        if (!referenceId || !referenceId.includes('-')) {
+            console.warn('Reference ID inválido ou no formato incorreto:', referenceId);
+            return res.status(400).json({ error: 'Reference ID inválido' });
+        }
+
+        const telegramId = parseInt(referenceId.split('-')[0]);
+
+        if (!isNaN(telegramId) && !isNaN(amount) && amount > 0) {
+            const user = await User.findByPk(telegramId);
+            if (user) {
+                // Atualiza o saldo do usuário
+                await user.increment('balance', { by: amount });
+                
+                // Registra a transação
+                await Transaction.create({
+                    userId: telegramId,
+                    amount: amount,
+                    type: 'deposit',
+                    description: `Depósito PagSeguro confirmado (ID: ${transactionId})`
+                });
+
+                console.log(`Pagamento confirmado para usuário ${telegramId}. Valor: R$ ${amount}. Saldo atualizado.`);
+                res.status(200).json({ message: 'Pagamento processado com sucesso' });
+            } else {
+                console.warn(`Usuário ${telegramId} não encontrado no DB para confirmação de pagamento (Ref: ${referenceId}).`);
+                res.status(404).json({ error: 'Usuário não encontrado' });
+            }
+        } else {
+            console.warn('Dados inválidos para processamento do pagamento:', { referenceId, amount, telegramId });
+            res.status(400).json({ error: 'Dados inválidos no pagamento' });
+        }
+    } catch (error) {
+        console.error('Erro ao processar pagamento:', error);
+        res.status(500).json({ error: 'Erro interno ao processar pagamento' });
+    }
+}
+
+/**
+ * Função auxiliar para fazer parse do XML do PagSeguro (V3)
+ * Esta é uma implementação simplificada - em produção use uma biblioteca como xml2js
+ */
+function parseXMLTransaction(xmlData) {
+    // Implementação simplificada - em produção use xml2js ou similar
+    const codeMatch = xmlData.match(/<code>(.*?)<\/code>/);
+    const statusMatch = xmlData.match(/<status>(\d+)<\/status>/);
+    const referenceMatch = xmlData.match(/<reference>(.*?)<\/reference>/);
+    const grossAmountMatch = xmlData.match(/<grossAmount>([\d.]+)<\/grossAmount>/);
+
+    return {
+        code: codeMatch ? codeMatch[1] : null,
+        status: statusMatch ? parseInt(statusMatch[1]) : null,
+        reference: referenceMatch ? referenceMatch[1] : null,
+        grossAmount: grossAmountMatch ? parseFloat(grossAmountMatch[1]) : null
+    };
+}
+
+/**
+ * Processa pagamento do formato V3 (XML)
+ */
+async function processPayment(transactionData, res) {
+    try {
+        const referenceId = transactionData.reference;
+        const amount = transactionData.grossAmount;
+        const transactionCode = transactionData.code;
+
+        await processPaymentFromReference(referenceId, amount, transactionCode, res);
+    } catch (error) {
+        console.error('Erro ao processar pagamento V3:', error);
+        res.status(500).json({ error: 'Erro ao processar pagamento V3' });
+    }
+}
+
+// Endpoint de health check
+app.get('/health', (_req, res) => {
+    res.status(200).json({ 
+        status: 'OK', 
+        timestamp: new Date().toISOString(),
+        service: 'webhook-pagseguro'
+    });
+});
+
+// Middleware de tratamento de erros global
+app.use((error, _req, res) => {
+    console.error('Erro não tratado:', error);
+    res.status(500).json({ error: 'Erro interno do servidor' });
+});
+
+// --- INICIALIZAÇÃO DO SERVIDOR WEBHOOK ---
+const PORT = process.env.PORT || 8080;
+
+app.listen(PORT, '0.0.0.0', () => {
+    console.log(`Servidor de webhook PagSeguro rodando na porta ${PORT}`);
+    console.log(`Health check disponível em: http://localhost:${PORT}/health`);
+    console.log(`Webhook endpoint: http://localhost:${PORT}/webhook/pagseguro`);
 });

@@ -2,20 +2,23 @@
 // --- Importações de Módulos ---
 require('dotenv').config(); // Carrega as variáveis de ambiente do arquivo .env
 const TelegramBot = require('node-telegram-bot-api');
-const { Sequelize, DataTypes, Op } = require('sequelize'); // Importa Sequelize, DataTypes e Op para operações de consulta
-const axios = require('axios'); // Para fazer requisições HTTP (API da Wegate)
+const { Sequelize, DataTypes } = require('sequelize'); // Importa Sequelize, DataTypes e Op para operações de consulta
+const axios = require('axios'); // Para fazer requisições HTTP (API da Wegate e PagSeguro)
 const qrcode = require('qrcode'); // Para gerar QR Codes
 
 // --- Variáveis de Configuração (Lidas de Variáveis de Ambiente) ---
+const PAGBANK_API_TOKEN = process.env.PAGBANK_API_TOKEN;
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const DATABASE_URL = process.env.DATABASE_URL; // URL de conexão do PostgreSQL
-const WEGATE_API_KEY = process.env.WEGATE_API_KEY;
-const WEGATE_PIX_API_URL = process.env.WEGATE_PIX_API_URL;
-const MY_PIX_KEY = process.env.MY_PIX_KEY;
+
+
+const PAGBANK_API_URL = 'https://api.pagseguro.com/orders'; // URL da API do PagSeguro
+
 
 // Verifica se as variáveis essenciais estão definidas
-if (!TELEGRAM_BOT_TOKEN || !DATABASE_URL || !WEGATE_API_KEY || !WEGATE_PIX_API_URL || !MY_PIX_KEY) {
-    console.error('ERRO: Por favor, configure todas as variáveis de ambiente no arquivo .env ou no ambiente de deploy.');
+if (!TELEGRAM_BOT_TOKEN || !DATABASE_URL || !PAGBANK_API_TOKEN) {
+    console.error('ERRO: Por favor, configure todas as variáveis de ambiente essenciais no arquivo .env ou no ambiente de deploy.');
+    console.error('Variáveis obrigatórias: TELEGRAM_BOT_TOKEN, DATABASE_URL, PAGBANK_API_TOKEN');
     process.exit(1);
 }
 
@@ -80,6 +83,14 @@ const Transaction = sequelize.define('Transaction', {
     timestamp: {
         type: DataTypes.DATE, // Data e hora da transação
         defaultValue: DataTypes.NOW
+    },
+    paymentId: { // Novo campo para armazenar ID do pagamento (PagSeguro ou Wegate)
+        type: DataTypes.STRING,
+        allowNull: true
+    },
+    paymentMethod: { // Novo campo para identificar método de pagamento
+        type: DataTypes.ENUM('pix_wegate', 'pix_pagseguro', 'credit_card', 'boleto'),
+        allowNull: true
     }
 });
 
@@ -88,14 +99,12 @@ User.hasMany(Transaction, { foreignKey: 'userId', onDelete: 'CASCADE' }); // Um 
 Transaction.belongsTo(User, { foreignKey: 'userId' }); // Uma transação pertence a um usuário
 
 /**
- * Função para garantir que o tipo ENUM 'enum_Transactions_type' existe e contém 'admin_adjustment'.
- * Esta função tenta adicionar o valor 'admin_adjustment' se ele ainda não existir no ENUM.
- * Isso ajuda a contornar problemas de alteração de ENUM do Sequelize.
+ * Função para garantir que o tipo ENUM existe e contém todos os valores necessários.
  */
-async function ensureEnumType() {
+async function ensureEnumTypes() {
     try {
-        // Verifica se o valor 'admin_adjustment' já existe no ENUM
-        const [results] = await sequelize.query(`
+        // Verifica e adiciona valores ao ENUM de Transaction type
+        const [transactionResults] = await sequelize.query(`
             SELECT enumlabel
             FROM pg_enum
             WHERE enumtypid = (
@@ -103,56 +112,38 @@ async function ensureEnumType() {
             ) AND enumlabel = 'admin_adjustment';
         `);
 
-        if (results.length === 0) {
-            // Se 'admin_adjustment' não existe, adiciona ao ENUM.
-            // A cláusula 'ADD VALUE' requer que o tipo ENUM já exista.
+        if (transactionResults.length === 0) {
             await sequelize.query(`
                 ALTER TYPE "public"."enum_Transactions_type" ADD VALUE 'admin_adjustment' AFTER 'refund';
             `);
             console.log('ENUM value "admin_adjustment" added to "enum_Transactions_type".');
-        } else {
-            console.log('ENUM value "admin_adjustment" already exists in "enum_Transactions_type".');
         }
+
+        // Para o ENUM de payment methods (será criado automaticamente pelo Sequelize)
+        console.log('ENUM types verified/updated successfully.');
     } catch (error) {
-        // Este catch lida com o caso em que o tipo ENUM "enum_Transactions_type" ainda não existe.
-        // O Sequelize.sync({ alter: true }) irá criá-lo depois.
-        // Ou, se houver um problema de "duplicate_object" mais profundo, o comando DROP TYPE manual é necessário.
-        console.warn('Não foi possível verificar/alterar o tipo ENUM "enum_Transactions_type" (o tipo pode não existir ainda ou outro problema):', error.message);
+        console.warn('Não foi possível verificar/alterar os tipos ENUM:', error.message);
     }
 }
 
 // --- Sincronização do Banco de Dados ---
 async function syncDatabase() {
     try {
-        // Primeiro, tente garantir que o tipo ENUM esteja configurado corretamente.
-        // Isso é um passo proativo para lidar com as peculiaridades de alteração de ENUM do Sequelize.
-        await ensureEnumType();
-
-        // Em seguida, execute a operação de sincronização do Sequelize.
-        // 'alter: true' tenta modificar a tabela existente para corresponder ao modelo.
+        await ensureEnumTypes();
         await sequelize.sync({ alter: true }); 
         console.log('Banco de dados PostgreSQL sincronizado (tabelas criadas/atualizadas com ALTER)!');
     } catch (err) {
         console.error('Erro ao sincronizar o banco de dados PostgreSQL:', err);
-        // O erro 'duplicar valor da chave viola a restrição de unicidade "pg_type_typname_nsp_index"'
-        // geralmente acontece por um tipo ENUM já existente.
-        // Se este erro persistir, você DEVE executar manualmente:
-        // DROP TYPE IF EXISTS "enum_Transactions_type" CASCADE;
-        // no seu DB via pgAdmin/psql.
         process.exit(1);
     }
 }
 
 syncDatabase(); // Chama a função assíncrona para iniciar a sincronização do DB
 
-
 // --- Funções de Ajuda do Banco de Dados ---
 
 /**
  * Encontra um usuário ou o cria se não existir.
- * @param {number} telegramId - ID do Telegram do usuário.
- * @param {string} username - Nome de usuário do Telegram.
- * @returns {Promise<Model>} O modelo do usuário.
  */
 async function findOrCreateUser(telegramId, username) {
     const [user, created] = await User.findOrCreate({
@@ -169,13 +160,8 @@ async function findOrCreateUser(telegramId, username) {
 
 /**
  * Atualiza o saldo do usuário e registra uma transação.
- * @param {number} telegramId - ID do Telegram do usuário.
- * @param {number} amount - Valor a ser adicionado (positivo) ou subtraído (negativo).
- * @param {string} type - Tipo da transação ('deposit', 'purchase', 'refund', 'admin_adjustment').
- * @param {string} description - Descrição da transação.
- * @returns {Promise<Model>} O modelo do usuário atualizado.
  */
-async function updateUserBalance(telegramId, amount, type, description = '') {
+async function updateUserBalance(telegramId, amount, type, description = '', paymentId = null, paymentMethod = null) {
     const user = await User.findByPk(telegramId);
     if (user) {
         await user.increment('balance', { by: amount });
@@ -183,12 +169,355 @@ async function updateUserBalance(telegramId, amount, type, description = '') {
             userId: telegramId,
             amount,
             type,
-            description
+            description,
+            paymentId,
+            paymentMethod
         });
         await user.reload(); // Recarrega o usuário para ter o saldo atualizado
         console.log(`Saldo de ${user.username} (${telegramId}) atualizado em ${amount}. Novo saldo: ${user.balance}`);
     }
     return user;
+}
+
+// --- Funções do PagSeguro ---
+
+/**
+ * Cria um pagamento PIX via PagSeguro
+ */
+async function createPagSeguroPIX(amount, telegramId, username) {
+    try {
+        const referenceId = `telegram-${telegramId}-${Date.now()}`;
+        
+        const orderData = {
+            reference_id: referenceId,
+            customer: {
+                name: username || 'Cliente Telegram',
+                email: `user${telegramId}@telegram.bot`, // Email fictício
+                tax_id: "12345678909" // CPF fictício para teste
+            },
+            items: [{
+                reference_id: "item-001",
+                name: "Recarga de Saldo",
+                quantity: 1,
+                unit_amount: Math.round(amount * 100) // PagSeguro trabalha com centavos
+            }],
+            qr_codes: [{
+                amount: {
+                    value: Math.round(amount * 100) // Valor em centavos
+                },
+                expiration_date: new Date(Date.now() + 30 * 60 * 1000).toISOString() // 30 minutos
+            }],
+            notification_urls: [`${process.env.WEBHOOK_URL}/webhook/pagseguro`] // URL do seu webhook
+        };
+
+        const response = await axios.post(PAGBANK_API_URL, orderData, {
+            headers: {
+                'Authorization': `Bearer ${PAGBANK_API_TOKEN}`,
+                'Content-Type': 'application/json'
+            }
+        });
+
+        return {
+            success: true,
+            orderId: response.data.id,
+            pixCode: response.data.qr_codes[0].text,
+            qrCodeImage: response.data.qr_codes[0].links[0].href,
+            referenceId
+        };
+
+    } catch (error) {
+        console.error('Erro ao criar PIX PagSeguro:', error.response?.data || error.message);
+        return {
+            success: false,
+            error: error.response?.data?.error_messages || 'Erro desconhecido'
+        };
+    }
+}
+
+// Função para gerar GG (Gift Cards/Códigos)
+// Função para gerar GG (Gift Cards/Códigos)
+function generateGG() {
+    try {
+        // Gera um código único no formato GG + timestamp + código aleatório
+        const timestamp = Date.now().toString().slice(-6);
+        const randomCode = Math.random().toString(36).substring(2, 8).toUpperCase();
+        const code = `GG${timestamp}${randomCode}`;
+        
+        return code;
+    } catch (error) {
+        console.error('Erro ao gerar GG:', error);
+        return null;
+    }
+}
+
+// Função para gerar dados de cartão de crédito para teste
+function generateTestCreditCardData() {
+    try {
+        // Números de cartão de teste válidos (Luhn algorithm)
+        const testCards = [
+            '4111111111111111', // Visa
+            '4000000000000002', // Visa
+            '5555555555554444', // Mastercard
+            '5105105105105100', // Mastercard
+            '378282246310005',  // American Express
+            '371449635398431',  // American Express
+            '6011111111111117', // Discover
+            '6011000990139424'  // Discover
+        ];
+        
+        const randomCard = testCards[Math.floor(Math.random() * testCards.length)];
+        const expMonth = String(Math.floor(Math.random() * 12) + 1).padStart(2, '0');
+        const expYear = String(2025 + Math.floor(Math.random() * 5));
+        const cvv = String(Math.floor(Math.random() * 900) + 100);
+        
+        return `${randomCard}|${expMonth}|${expYear}|${cvv}`;
+    } catch (error) {
+        console.error('Erro ao gerar cartão de teste:', error);
+        return null;
+    }
+}
+
+// Função para verificar o status de GG/Cards
+async function checkGGStatus(itemType, item) {
+    try {
+        if (!item) return 'ERRO';
+        
+        switch (itemType) {
+            case 'gg': {
+                // Simula verificação de status do GG
+                const ggStatuses = ['LIVE', 'DIE', 'UNKNOWN'];
+                return ggStatuses[Math.floor(Math.random() * ggStatuses.length)];
+            }
+                
+            case 'card':
+            case 'cartao': {
+                // Simula verificação de status do cartão
+                const cardStatuses = ['LIVE', 'DIE', 'UNKNOWN'];
+                return cardStatuses[Math.floor(Math.random() * cardStatuses.length)];
+            }
+                
+            default:
+                return 'UNKNOWN';
+        }
+    } catch (error) {
+        console.error('Erro ao verificar status:', error);
+        return 'ERRO';
+    }
+}
+
+// Comando de compra principal
+bot.onText(/\/comprar (.+) (.+)/, async (msg, match) => {
+    const chatId = msg.chat.id;
+    const telegramId = msg.from.id;
+    const itemType = match[1].toLowerCase();
+    const quantity = parseInt(match[2]);
+
+    if (isNaN(quantity) || quantity <= 0) {
+        return bot.sendMessage(chatId, '❌ Quantidade inválida. Use um número positivo.\n📝 Ex: /comprar gg 1');
+    }
+
+    if (quantity > 50) {
+        return bot.sendMessage(chatId, '❌ Quantidade máxima por compra: 50 itens');
+    }
+
+    const user = await User.findByPk(telegramId);
+    if (!user) {
+        return bot.sendMessage(chatId, 'Você ainda não está registrado. Use /start para criar uma conta.');
+    }
+
+    let pricePerItem = 0;
+    let generateFunction;
+    let itemDescription = '';
+
+    switch (itemType) {
+        case 'gg': {
+            pricePerItem = 10.0;
+            generateFunction = generateGG;
+            itemDescription = 'GG';
+            break;
+        }
+        case 'card':
+        case 'cartao': {
+            pricePerItem = 5.0;
+            generateFunction = generateTestCreditCardData;
+            itemDescription = 'cartão de teste';
+            break;
+        }
+        default:
+            return bot.sendMessage(chatId, '❌ Tipo de item inválido.\n✅ Escolha "gg" ou "card".\n\n📖 Exemplos:\n/comprar gg 5\n/comprar card 10');
+    }
+
+    const totalCost = quantity * pricePerItem;
+
+    if (user.balance < totalCost) {
+        return bot.sendMessage(chatId, `❌ Saldo insuficiente!\n💰 Necessário: R$ ${totalCost.toFixed(2)}\n💳 Seu saldo: R$ ${user.balance.toFixed(2)}\n\n💡 Use /depositar para recarregar.`);
+    }
+
+    try {
+        // Processa o pagamento
+        bot.sendMessage(chatId, '⏳ Processando compra...');
+
+        const updatedUser = await updateUserBalance(telegramId, -totalCost, 'purchase', 
+            `Compra de ${quantity} ${itemDescription}(s)`, null, 'purchase');
+
+        let generatedItems = [];
+        let liveCount = 0;
+        let dieCount = 0;
+        let unknownCount = 0;
+
+        // Gera os itens
+        for (let i = 0; i < quantity; i++) {
+            const item = generateFunction();
+            if (item) {
+                const itemStatus = await checkGGStatus(itemType, item);
+                generatedItems.push(`${item} [${itemStatus}]`);
+                
+                // Conta estatísticas
+                switch (itemStatus) {
+                    case 'LIVE': liveCount++; break;
+                    case 'DIE': dieCount++; break;
+                    default: unknownCount++; break;
+                }
+            } else {
+                generatedItems.push('ERRO NA GERAÇÃO');
+            }
+        }
+
+        // Monta a mensagem de resposta
+        let responseMessage = `✅ Compra realizada com sucesso!\n`;
+        responseMessage += `💰 Saldo restante: R$ ${updatedUser.balance.toFixed(2)}\n`;
+        responseMessage += `📊 Estatísticas: 🟢${liveCount} | 🔴${dieCount} | ⚪${unknownCount}\n\n`;
+        responseMessage += `🎯 Seus ${itemDescription}(s):\n\`\`\`\n`;
+        responseMessage += `${generatedItems.join('\n')}\n\`\`\``;
+
+        // Divide mensagem se for muito longa
+        if (responseMessage.length > 4000) {
+            // Envia estatísticas primeiro
+            const statsMessage = `✅ Compra realizada com sucesso!\n💰 Saldo restante: R$ ${updatedUser.balance.toFixed(2)}\n📊 Estatísticas: 🟢${liveCount} | 🔴${dieCount} | ⚪${unknownCount}`;
+            await bot.sendMessage(chatId, statsMessage);
+
+            // Divide os itens em grupos
+            const itemsPerMessage = 30;
+            for (let i = 0; i < generatedItems.length; i += itemsPerMessage) {
+                const itemsGroup = generatedItems.slice(i, i + itemsPerMessage);
+                const itemsMessage = `🎯 ${itemDescription}(s) - Parte ${Math.floor(i / itemsPerMessage) + 1}:\n\`\`\`\n${itemsGroup.join('\n')}\n\`\`\``;
+                await bot.sendMessage(chatId, itemsMessage, { parse_mode: 'Markdown' });
+                
+                // Delay entre mensagens
+                if (i + itemsPerMessage < generatedItems.length) {
+                    await new Promise(resolve => setTimeout(resolve, 1000));
+                }
+            }
+        } else {
+            await bot.sendMessage(chatId, responseMessage, { parse_mode: 'Markdown' });
+        }
+
+        // Log da compra
+        console.log(`Compra realizada - User: ${telegramId}, Tipo: ${itemType}, Quantidade: ${quantity}, Valor: R$ ${totalCost}`);
+
+    } catch (error) {
+        console.error('Erro no processamento da compra:', error);
+        
+        // Reverte o saldo em caso de erro
+        try {
+            await updateUserBalance(telegramId, totalCost, 'refund', 
+                `Reembolso - Erro na compra de ${quantity} ${itemDescription}(s)`, null, 'refund');
+            bot.sendMessage(chatId, '❌ Erro no processamento da compra. Seu saldo foi reembolsado.');
+        } catch (refundError) {
+            console.error('Erro no reembolso:', refundError);
+            bot.sendMessage(chatId, '❌ Erro crítico na compra. Entre em contato com o suporte.');
+        }
+    }
+});
+
+// Comando para listar preços
+bot.onText(/\/precos/, async (msg) => {
+    const chatId = msg.chat.id;
+    
+    const priceList = `💰 **Lista de Preços** 💰\n\n` +
+                     `🎯 **GG (Gift Cards):**\n` +
+                     `• Preço: R$ 10,00 cada\n` +
+                     `• Exemplo: /comprar gg 5\n\n` +
+                     `💳 **Cartões de Teste:**\n` +
+                     `• Preço: R$ 5,00 cada\n` +
+                     `• Exemplo: /comprar card 10\n\n` +
+                     `⚡ **Limites:**\n` +
+                     `• Máximo 50 itens por compra\n` +
+                     `• Saldo mínimo necessário\n\n` +
+                     `📊 **Status possíveis:**\n` +
+                     `🟢 LIVE - Funcionando\n` +
+                     `🔴 DIE - Não funcionando\n` +
+                     `⚪ UNKNOWN - Status desconhecido`;
+
+    bot.sendMessage(chatId, priceList, { parse_mode: 'Markdown' });
+});
+
+/**
+ * Cria um pagamento com cartão de crédito via PagSeguro
+ */
+async function createPagSeguroCard(amount, telegramId, username, cardData) {
+    try {
+        const referenceId = `telegram-card-${telegramId}-${Date.now()}`;
+        
+        const orderData = {
+            reference_id: referenceId,
+            customer: {
+                name: username || 'Cliente Telegram',
+                email: `user${telegramId}@telegram.bot`,
+                tax_id: "12345678909"
+            },
+            items: [{
+                reference_id: "item-001",
+                name: "Recarga de Saldo",
+                quantity: 1,
+                unit_amount: Math.round(amount * 100)
+            }],
+            charges: [{
+                reference_id: referenceId,
+                description: "Recarga de saldo via cartão",
+                amount: {
+                    value: Math.round(amount * 100),
+                    currency: "BRL"
+                },
+                payment_method: {
+                    type: "CREDIT_CARD",
+                    installments: 1,
+                    capture: true,
+                    card: {
+                        number: cardData.number,
+                        exp_month: cardData.expMonth,
+                        exp_year: cardData.expYear,
+                        security_code: cardData.cvv,
+                        holder: {
+                            name: cardData.holderName || username || 'Cliente Telegram'
+                        }
+                    }
+                }
+            }],
+            notification_urls: [`${process.env.WEBHOOK_URL}/webhook/pagseguro`]
+        };
+
+        const response = await axios.post(PAGBANK_API_URL, orderData, {
+            headers: {
+                'Authorization': `Bearer ${PAGBANK_API_TOKEN}`,
+                'Content-Type': 'application/json'
+            }
+        });
+
+        return {
+            success: true,
+            orderId: response.data.id,
+            status: response.data.charges[0].status,
+            referenceId
+        };
+
+    } catch (error) {
+        console.error('Erro ao processar cartão PagSeguro:', error.response?.data || error.message);
+        return {
+            success: false,
+            error: error.response?.data?.error_messages || 'Erro desconhecido'
+        };
+    }
 }
 
 // --- Comandos do Bot ---
@@ -200,22 +529,21 @@ bot.onText(/\/start/, async (msg) => {
     const username = msg.from.username || msg.from.first_name || 'Usuário';
 
     const user = await findOrCreateUser(telegramId, username);
-    bot.sendMessage(chatId, `Olá, ${username}! Bem-vindo ao bot de GGs e cartões de teste. Seu saldo atual é: R$ ${user.balance.toFixed(2)}.`);
-});
+    
+    const welcomeMessage = `🎮 Olá, ${username}! Bem-vindo ao bot de GGs e cartões de teste!\n\n` +
+        `💰 Seu saldo atual: R$ ${user.balance.toFixed(2)}\n\n` +
+        `📋 Comandos disponíveis:\n` +
+        `/saldo - Ver seu saldo atual\n` +
+        `/depositar <valor> - Fazer depósito via PIX\n` +
+        `/depositarcartao <valor> - Depositar via cartão\n` +
+        `/comprar <tipo> <qtd> - Comprar GGs ou cartões\n` +
+        `   Tipos: gg, card\n` +
+        `   Ex: /comprar gg 5\n\n` +
+        `💳 Métodos de pagamento:\n` +
+        `• PIX (Wegate ou PagSeguro)\n` +
+        `• Cartão de Crédito (PagSeguro)`;
 
-// Comando /registrar
-bot.onText(/\/registrar/, async (msg) => {
-    const chatId = msg.chat.id;
-    const telegramId = msg.from.id;
-    const username = msg.from.username || msg.from.first_name || 'Usuário';
-
-    const user = await User.findByPk(telegramId); // findOrCreateUser já lida com a criação
-    if (user) {
-        bot.sendMessage(chatId, 'Você já está registrado!');
-    } else {
-        await findOrCreateUser(telegramId, username);
-        bot.sendMessage(chatId, 'Você foi registrado com sucesso! Seu saldo inicial é R$ 0.00.');
-    }
+    bot.sendMessage(chatId, welcomeMessage);
 });
 
 // Comando /saldo
@@ -225,67 +553,190 @@ bot.onText(/\/saldo/, async (msg) => {
 
     const user = await User.findByPk(telegramId);
     if (user) {
-        bot.sendMessage(chatId, `Seu saldo atual: R$ ${user.balance.toFixed(2)}`);
+        // Buscar últimas transações
+        const recentTransactions = await Transaction.findAll({
+            where: { userId: telegramId },
+            order: [['timestamp', 'DESC']],
+            limit: 5
+        });
+
+        let message = `💰 Seu saldo atual: R$ ${user.balance.toFixed(2)}\n\n`;
+        
+        if (recentTransactions.length > 0) {
+            message += `📊 Últimas transações:\n`;
+            recentTransactions.forEach(transaction => {
+                const icon = transaction.type === 'deposit' ? '➕' : transaction.type === 'purchase' ? '➖' : '🔄';
+                const date = new Date(transaction.timestamp).toLocaleDateString('pt-BR');
+                message += `${icon} R$ ${Math.abs(transaction.amount).toFixed(2)} - ${transaction.description} (${date})\n`;
+            });
+        }
+
+        bot.sendMessage(chatId, message);
     } else {
-        bot.sendMessage(chatId, 'Você ainda não está registrado. Use /registrar para criar uma conta.');
+        bot.sendMessage(chatId, 'Você ainda não está registrado. Use /start para criar uma conta.');
     }
 });
 
-// Comando /depositar <valor>
+// Comando /depositar <valor> - PIX via PagSeguro ou Wegate
 bot.onText(/\/depositar (.+)/, async (msg, match) => {
     const chatId = msg.chat.id;
     const telegramId = msg.from.id;
     const amount = parseFloat(match[1]);
 
     if (isNaN(amount) || amount <= 0) {
-        return bot.sendMessage(chatId, 'Por favor, informe um valor positivo para depósito. Ex: /depositar 10');
+        return bot.sendMessage(chatId, '❌ Por favor, informe um valor positivo para depósito.\n📝 Ex: /depositar 10');
+    }
+
+    if (amount < 1) {
+        return bot.sendMessage(chatId, '❌ Valor mínimo para depósito: R$ 10,0');
     }
 
     const user = await User.findByPk(telegramId);
     if (!user) {
-        return bot.sendMessage(chatId, 'Você ainda não está registrado. Use /registrar para criar uma conta antes de depositar.');
+        return bot.sendMessage(chatId, 'Você ainda não está registrado. Use /start para criar uma conta antes de depositar.');
     }
 
-    try {
-        const pixPayload = {
-            value: amount.toFixed(2),
-            description: `Depósito para o usuário ${msg.from.username || telegramId}`,
-            reference_id: `${telegramId}-${Date.now()}`,
+    // Botão único para PIX PagSeguro
+    const keyboard = {
+        inline_keyboard: [
+            [
+                { text: '🟢 PIX PagSeguro', callback_data: `pix_pagseguro_${amount}` }
+            ]
+        ]
+    };
+
+    bot.sendMessage(chatId, `💳 Depositar R$ ${amount.toFixed(2)} via PIX:`, {
+        reply_markup: keyboard
+    });
+});
+
+// Comando /depositarcartao <valor>
+bot.onText(/\/depositarcartao (.+)/, async (msg, match) => {
+    const chatId = msg.chat.id;
+    const telegramId = msg.from.id;
+    const amount = parseFloat(match[1]);
+
+    if (isNaN(amount) || amount <= 0) {
+        return bot.sendMessage(chatId, '❌ Por favor, informe um valor positivo para depósito.\n📝 Ex: /depositarcartao 50');
+    }
+
+    if (amount < 5) {
+        return bot.sendMessage(chatId, '❌ Valor mínimo para depósito via cartão: R$ 5,00');
+    }
+
+    const user = await User.findByPk(telegramId);
+    if (!user) {
+        return bot.sendMessage(chatId, 'Você ainda não está registrado. Use /start para criar uma conta antes de depositar.');
+    }
+
+    // Solicita dados do cartão
+    bot.sendMessage(chatId, `💳 Para depositar R$ ${amount.toFixed(2)} via cartão, envie os dados no formato:\n\n` +
+        `📝 Formato: NÚMERO MESVENC ANOVENC CVV NOME\n` +
+        `📝 Exemplo: 4111111111111111 12 2025 123 João Silva\n\n` +
+        `⚠️ Os dados serão processados de forma segura pelo PagSeguro.`);
+        
+    // Aguarda próxima mensagem com dados do cartão
+    bot.once('message', async (cardMsg) => {
+        if (cardMsg.from.id !== telegramId) return;
+        
+        const cardInfo = cardMsg.text.trim().split(' ');
+        if (cardInfo.length < 5) {
+            return bot.sendMessage(chatId, '❌ Formato inválido. Use: NÚMERO MÊS ANO CVV NOME COMPLETO');
+        }
+
+        const cardData = {
+            number: cardInfo[0],
+            expMonth: cardInfo[1],
+            expYear: cardInfo[2],
+            cvv: cardInfo[3],
+            holderName: cardInfo.slice(4).join(' ')
         };
 
-        const wegateResponse = await axios.post(`${WEGATE_PIX_API_URL}/generate`, pixPayload, {
-            headers: {
-                'Authorization': `Bearer ${WEGATE_API_KEY}`,
-                'Content-Type': 'application/json'
+        bot.sendMessage(chatId, '⏳ Processando pagamento...');
+
+        try {
+            const result = await createPagSeguroCard(amount, telegramId, user.username, cardData);
+            
+            if (result.success) {
+                if (result.status === 'PAID') {
+                    await updateUserBalance(telegramId, amount, 'deposit', 
+                        `Depósito via cartão - PagSeguro`, result.orderId, 'credit_card');
+                    bot.sendMessage(chatId, `✅ Pagamento aprovado!\n💰 R$ ${amount.toFixed(2)} foi adicionado ao seu saldo.`);
+                } else {
+                    bot.sendMessage(chatId, `⏳ Pagamento em processamento.\nStatus: ${result.status}\nVocê será notificado quando for aprovado.`);
+                }
+            } else {
+                bot.sendMessage(chatId, `❌ Erro no pagamento: ${result.error || 'Erro desconhecido'}`);
             }
-        });
+        } catch (error) {
+            console.error('Erro no processamento do cartão:', error);
+            bot.sendMessage(chatId, '❌ Erro interno no processamento. Tente novamente mais tarde.');
+        }
+    });
+});
 
-        const pixData = wegateResponse.data.qrcode_data || wegateResponse.data.qr_code_image_base64_data;
-        const pixCopyPasteCode = wegateResponse.data.pix_code;
+// Handler para callbacks dos botões inline
+bot.on('callback_query', async (callbackQuery) => {
+    const chatId = callbackQuery.message.chat.id;
+    const telegramId = callbackQuery.from.id;
+    const data = callbackQuery.data;
 
-        let imageBuffer;
-        if (pixData.startsWith('data:image')) {
-            imageBuffer = Buffer.from(pixData.replace(/^data:image\/\w+;base64,/, ""), 'base64');
-        } else {
-            const qrCodeImageBase64 = await qrcode.toDataURL(pixData);
-            imageBuffer = Buffer.from(qrCodeImageBase64.replace(/^data:image\/\w+;base64,/, ""), 'base64');
+    try {
+        if (data.startsWith('pix_pagseguro_')) {
+            const amount = parseFloat(data.replace('pix_pagseguro_', ''));
+            await handlePagSeguroPIX(chatId, telegramId, amount);
         }
         
-        bot.sendPhoto(chatId, imageBuffer, {
-            caption: `Para depositar R$ ${amount.toFixed(2)}, faça um PIX para a chave ou o QR Code abaixo:\n\n` +
-                     `**Sua Chave PIX:** \`${MY_PIX_KEY}\`\n\n` +
-                     `**Código PIX Copia e Cola:**\n\`${pixCopyPasteCode}\`\n\n` +
-                     `*Importante: O saldo será creditado automaticamente após a confirmação do pagamento pela Wegate.*`
-        }, { contentType: 'image/png' });
-
+        bot.answerCallbackQuery(callbackQuery.id);
     } catch (error) {
-        console.error('Erro ao gerar PIX ou enviar QR Code:', error.message || error);
-        if (error.response) {
-            console.error('Dados do erro da API Wegate:', error.response.data);
-        }
-        bot.sendMessage(chatId, 'Ocorreu um erro ao processar seu depósito. Por favor, tente novamente mais tarde ou entre em contato com o suporte.');
+        console.error('Erro no callback query:', error);
+        bot.answerCallbackQuery(callbackQuery.id, { text: '❌ Erro interno. Tente novamente.' });
     }
 });
+
+// Função para processar PIX PagSeguro
+async function handlePagSeguroPIX(chatId, telegramId, amount) {
+    try {
+        const user = await User.findByPk(telegramId);
+        
+        if (!user) {
+            return bot.sendMessage(chatId, '❌ Usuário não encontrado. Use /start para se registrar.');
+        }
+        
+        bot.sendMessage(chatId, '⏳ Gerando PIX PagSeguro...');
+
+        const result = await createPagSeguroPIX(amount, telegramId, user.username);
+        
+        if (result.success) {
+            try {
+                // Gera QR Code a partir do código PIX
+                const qrCodeBuffer = await qrcode.toBuffer(result.pixCode);
+                
+                bot.sendPhoto(chatId, qrCodeBuffer, {
+                    caption: `💰 PIX PagSeguro - R$ ${amount.toFixed(2)}\n\n` +
+                             `📱 Código PIX Copia e Cola:\n\`${result.pixCode}\`\n\n` +
+                             `⏰ Válido por 30 minutos\n` +
+                             `✅ Seu saldo será creditado automaticamente após o pagamento.`,
+                    parse_mode: 'Markdown'
+                });
+            } catch (qrError) {
+                console.error('Erro ao gerar QR Code:', qrError);
+                bot.sendMessage(chatId, `💰 PIX PagSeguro - R$ ${amount.toFixed(2)}\n\n` +
+                               `📱 Código PIX Copia e Cola:\n\`${result.pixCode}\`\n\n` +
+                               `⏰ Válido por 30 minutos\n` +
+                               `✅ Seu saldo será creditado automaticamente após o pagamento.`,
+                               { parse_mode: 'Markdown' });
+            }
+        } else {
+            bot.sendMessage(chatId, `❌ Erro ao gerar PIX PagSeguro: ${result.error || 'Erro desconhecido'}`);
+        }
+    } catch (error) {
+        console.error('Erro no handlePagSeguroPIX:', error);
+        bot.sendMessage(chatId, '❌ Erro interno. Tente novamente mais tarde.');
+    }
+}
+
+
 
 // Comando /comprar <tipo> <quantidade>
 bot.onText(/\/comprar (.+) (.+)/, async (msg, match) => {
@@ -295,12 +746,12 @@ bot.onText(/\/comprar (.+) (.+)/, async (msg, match) => {
     const quantity = parseInt(match[2]);
 
     if (isNaN(quantity) || quantity <= 0) {
-        return bot.sendMessage(chatId, 'Quantidade inválida. Use um número positivo. Ex: /comprar gg 1');
+        return bot.sendMessage(chatId, '❌ Quantidade inválida. Use um número positivo.\n📝 Ex: /comprar gg 1');
     }
 
     const user = await User.findByPk(telegramId);
     if (!user) {
-        return bot.sendMessage(chatId, 'Você ainda não está registrado. Use /registrar para criar uma conta.');
+        return bot.sendMessage(chatId, 'Você ainda não está registrado. Use /start para criar uma conta.');
     }
 
     let pricePerItem = 0;
@@ -309,7 +760,7 @@ bot.onText(/\/comprar (.+) (.+)/, async (msg, match) => {
 
     switch (itemType) {
         case 'gg':
-            pricePerItem = 5.0; // Preço por GG
+            pricePerItem = 10.0; // Preço por GG
             generateFunction = generateGG;
             itemDescription = 'GG';
             break;
@@ -320,311 +771,142 @@ bot.onText(/\/comprar (.+) (.+)/, async (msg, match) => {
             itemDescription = 'cartão de teste';
             break;
         default:
-            return bot.sendMessage(chatId, 'Tipo de item inválido. Escolha "gg" ou "card".');
+            return bot.sendMessage(chatId, '❌ Tipo de item inválido.\n✅ Escolha "gg" ou "card".');
     }
 
     const totalCost = quantity * pricePerItem;
 
     if (user.balance < totalCost) {
-        return bot.sendMessage(chatId, `Saldo insuficiente! Você precisa de R$ ${totalCost.toFixed(2)}, mas tem apenas R$ ${user.balance.toFixed(2)}.`);
+        return bot.sendMessage(chatId, `❌ Saldo insuficiente!\n💰 Necessário: R$ ${totalCost.toFixed(2)}\n💳 Seu saldo: R$ ${user.balance.toFixed(2)}\n\n💡 Use /depositar para recarregar.`);
     }
     
     const updatedUser = await updateUserBalance(telegramId, -totalCost, 'purchase', `Compra de ${quantity} ${itemDescription}(s)`);
 
     let generatedItems = [];
-    let responseMessage = `Compra de ${quantity} ${itemDescription}(s) realizada com sucesso! Saldo restante: R$ ${updatedUser.balance.toFixed(2)}.\n\n`;
-    responseMessage += `Seus ${itemDescription}(s):\n\`\`\`\n`;
+    let responseMessage = `✅ Compra realizada com sucesso!\n💰 Saldo restante: R$ ${updatedUser.balance.toFixed(2)}\n\n🎯 Seus ${itemDescription}(s):\n\`\`\`\n`;
 
     for (let i = 0; i < quantity; i++) {
         const item = generateFunction();
         const itemStatus = await checkGGStatus(itemType, item); 
-        generatedItems.push(`${item} [Status: ${itemStatus}]`); // Adiciona o status
+        generatedItems.push(`${item} [${itemStatus}]`);
     }
     responseMessage += `${generatedItems.join('\n')}\n\`\`\``;
 
     bot.sendMessage(chatId, responseMessage, { parse_mode: 'Markdown' });
 });
 
-// Comando de Administrador: /setsaldo <telegramId> <valor>
+// Comandos de Administrador (mantidos os existentes)
 bot.onText(/\/setsaldo (.+) (.+)/, async (msg, match) => {
     const chatId = msg.chat.id;
     const adminTelegramId = msg.from.id;
-    const targetTelegramId = parseInt(match[1]); // ID do usuário a ser modificado
-    const amount = parseFloat(match[2]); // Valor a ser adicionado/removido
+    const targetTelegramId = parseInt(match[1]);
+    const amount = parseFloat(match[2]);
 
-    // 1. Verificar se o usuário que emitiu o comando é um admin
     const adminUser = await User.findByPk(adminTelegramId);
     if (!adminUser || !adminUser.isAdmin) {
-        return bot.sendMessage(chatId, 'Acesso negado. Você não tem permissão de administrador para usar este comando.');
+        return bot.sendMessage(chatId, '❌ Acesso negado. Você não tem permissão de administrador.');
     }
 
-    // 2. Validar o valor
     if (isNaN(targetTelegramId) || isNaN(amount)) {
-        return bot.sendMessage(chatId, 'Uso: /setsaldo <ID_do_usuário> <valor>. Ex: /setsaldo 123456789 100');
+        return bot.sendMessage(chatId, '❌ Uso: /setsaldo <ID_do_usuário> <valor>\n📝 Ex: /setsaldo 123456789 100');
     }
 
-    // 3. Encontrar o usuário alvo
     const targetUser = await User.findByPk(targetTelegramId);
     if (!targetUser) {
-        return bot.sendMessage(chatId, `Usuário com ID ${targetTelegramId} não encontrado.`);
+        return bot.sendMessage(chatId, `❌ Usuário com ID ${targetTelegramId} não encontrado.`);
     }
 
-    // 4. Atualizar o saldo (usando a função updateUserBalance existente)
     try {
         const updatedUser = await updateUserBalance(targetTelegramId, amount, 'admin_adjustment', `Ajuste de saldo por admin ${adminTelegramId}`);
-        bot.sendMessage(chatId, `Saldo de ${updatedUser.username} (${updatedUser.telegramId}) ajustado. Novo saldo: R$ ${updatedUser.balance.toFixed(2)}.`);
+        bot.sendMessage(chatId, `✅ Saldo ajustado!\n👤 ${updatedUser.username} (${updatedUser.telegramId})\n💰 Novo saldo: R$ ${updatedUser.balance.toFixed(2)}`);
     } catch (error) {
         console.error('Erro ao ajustar saldo por admin:', error);
-        bot.sendMessage(chatId, 'Ocorreu um erro ao ajustar o saldo.');
+        bot.sendMessage(chatId, '❌ Erro ao ajustar o saldo.');
     }
 });
 
-// Comando de Administrador: /report
 bot.onText(/\/report/, async (msg) => {
     const chatId = msg.chat.id;
     const adminTelegramId = msg.from.id;
 
-    // 1. Verificar se o usuário que emitiu o comando é um admin
     const adminUser = await User.findByPk(adminTelegramId);
     if (!adminUser || !adminUser.isAdmin) {
-        return bot.sendMessage(chatId, 'Acesso negado. Você não tem permissão de administrador para usar este comando.');
+        return bot.sendMessage(chatId, '❌ Acesso negado. Você não tem permissão de administrador.');
     }
 
     try {
         const users = await User.findAll({
-            order: [['balance', 'DESC']], // Ordena por saldo decrescente
+            order: [['balance', 'DESC']],
         });
 
-        let reportMessage = '📊 **Relatório de Saldo de Usuários** 📊\n\n';
-        reportMessage += `Total de Usuários: ${users.length}\n\n`;
-        reportMessage += '--- Saldo por Usuário ---\n';
+        let reportMessage = '📊 **Relatório de Usuários** 📊\n\n';
+        reportMessage += `👥 Total: ${users.length} usuários\n\n`;
 
         if (users.length === 0) {
-            reportMessage += 'Nenhum usuário registrado ainda.\n';
+            reportMessage += 'Nenhum usuário registrado.\n';
         } else {
             for (const user of users) {
-                reportMessage += `\nID: ${user.telegramId}\n`;
-                reportMessage += `Username: ${user.username}\n`;
-                reportMessage += `Saldo: R$ ${user.balance.toFixed(2)}\n`;
-                reportMessage += `Admin: ${user.isAdmin ? 'Sim' : 'Não'}\n`;
+                reportMessage += `👤 ${user.username} (ID: ${user.telegramId})\n`;
+                reportMessage += `💰 Saldo: R$ ${user.balance.toFixed(2)}\n`;
+                reportMessage += `🔑 Admin: ${user.isAdmin ? 'Sim' : 'Não'}\n`;
+                reportMessage += `📅 Cadastro: ${user.createdAt.toLocaleDateString('pt-BR')}\n`;
+                reportMessage += `📈 Última atividade: ${user.updatedAt.toLocaleDateString('pt-BR')}\n`;
+                reportMessage += '─────────────────────\n';
             }
-        }
-        reportMessage += '\n-------------------------\n';
 
-        const today = new Date();
-        today.setHours(0, 0, 0, 0); // Começo do dia
-        const tomorrow = new Date(today);
-        tomorrow.setDate(today.getDate() + 1); // Fim do dia
+            // Estatísticas adicionais
+            const totalBalance = users.reduce((sum, user) => sum + parseFloat(user.balance), 0);
+            const adminsCount = users.filter(user => user.isAdmin).length;
+            const activeUsers = users.filter(user => {
+                const daysDiff = (new Date() - new Date(user.updatedAt)) / (1000 * 60 * 60 * 24);
+                return daysDiff <= 7; // Usuários ativos na última semana
+            }).length;
 
-        const dailyTransactions = await Transaction.findAll({
-            where: {
-                timestamp: {
-                    [Op.gte]: today,
-                    [Op.lt]: tomorrow,
-                },
-            },
-            include: [{
-                model: User,
-                attributes: ['telegramId', 'username']
-            }],
-            order: [['timestamp', 'ASC']],
-        });
-
-        reportMessage += `📅 **Transações de Hoje (${today.toLocaleDateString('pt-BR')})** 📅\n`;
-        if (dailyTransactions.length === 0) {
-            reportMessage += 'Nenhuma transação registrada hoje.\n';
-        } else {
-            for (const transaction of dailyTransactions) {
-                const username = transaction.User ? transaction.User.username : 'Desconhecido';
-                reportMessage += `\nUsuário: ${username} (ID: ${transaction.userId})\n`;
-                reportMessage += `Tipo: ${transaction.type}\n`;
-                reportMessage += `Valor: R$ ${transaction.amount.toFixed(2)}\n`;
-                reportMessage += `Descrição: ${transaction.description || 'N/A'}\n`;
-                reportMessage += `Hora: ${new Date(transaction.timestamp).toLocaleTimeString('pt-BR')}\n`;
-            }
-        }
-        reportMessage += '\n-------------------------\n';
-        reportMessage += 'Relatório gerado em: ' + new Date().toLocaleString('pt-BR');
-
-
-        bot.sendMessage(chatId, reportMessage, { parse_mode: 'Markdown' });
-
-    } catch (error) {
-        console.error('Erro ao gerar relatório de saldo:', error);
-        bot.sendMessage(chatId, 'Ocorreu um erro ao gerar o relatório. Por favor, tente novamente mais tarde.');
-    }
-});
-
-
-// --- Funções de Geração (GGs e Cartões de Teste) ---
-
-/**
- * Gera uma 'GG' no formato NNNNNNNNNNNNNNNN|NN|NNNN|NNN com um checksum simples.
- * Adiciona uma data de validade de 30 dias.
- * @returns {string} A GG gerada com data de validade e "checksum" implícito.
- */
-function generateGG() {
-    // Gerar segmentos aleatórios como antes
-    const segment1 = Math.floor(Math.random() * 10**16).toString().padStart(16, '0'); // 16 dígitos
-    const segment2 = Math.floor(Math.random() * 10**2).toString().padStart(2, '0');   // 2 dígitos
-    const segment3 = Math.floor(Math.random() * 10**4).toString().padStart(4, '0');   // 4 dígitos
-    const segment4 = Math.floor(Math.random() * 10**3).toString().padStart(3, '0');   // 3 dígitos
-    
-    // Data de validade (ex: 30 dias a partir de agora)
-    const expiryDate = new Date();
-    expiryDate.setDate(expiryDate.getDate() + 30);
-    const day = String(expiryDate.getDate()).padStart(2, '0');
-    const month = String(expiryDate.getMonth() + 1).padStart(2, '0'); // Mês é 0-indexed
-    const year = expiryDate.getFullYear();
-    const formattedExpiryDate = `${day}/${month}/${year}`;
-
-    return `${segment1}|${segment2}|${segment3}|${segment4} (Validade: ${formattedExpiryDate})`;
-}
-
-
-/**
- * Gera dados de cartão de crédito para TESTE (NÃO SÃO CARTÕES REAIS).
- * IMPORTANTE: Estes dados são para TESTE em ambientes de DESENVOLVIMENTO/SANDBOX.
- * NUNCA USE PARA TRANSAÇÕES REAIS.
- * Baseado em padrões de cartões de teste e algoritmo de Luhn.
- * @returns {string} Uma string formatada com os dados do cartão de teste.
- */
-function generateTestCreditCardData() {
-    const cardTypes = {
-        'Visa': '4',
-        'MasterCard': '5',
-        'Amex': '34,37',
-        'Discover': '6011'
-    };
-
-    const typeNames = Object.keys(cardTypes);
-    const randomTypeName = typeNames[Math.floor(Math.random() * typeNames.length)];
-    let prefix = cardTypes[randomTypeName];
-
-    if (randomTypeName === 'Amex') {
-        prefix = prefix.split(',')[Math.floor(Math.random() * prefix.split(',').length)]; // Escolhe entre 34 ou 37
-    }
-
-    const length = randomTypeName === 'Amex' ? 15 : 16;
-
-    // Implementação do Algoritmo de Luhn para gerar um número válido para testes
-    function generateLuhnNumber(basePrefix, len) {
-        let cardNumber = basePrefix;
-        while (cardNumber.length < len - 1) {
-            cardNumber += Math.floor(Math.random() * 10);
+            reportMessage += '\n📈 **Estatísticas Gerais**\n';
+            reportMessage += `💵 Saldo total no sistema: R$ ${totalBalance.toFixed(2)}\n`;
+            reportMessage += `👑 Administradores: ${adminsCount}\n`;
+            reportMessage += `🟢 Usuários ativos (7 dias): ${activeUsers}\n`;
+            reportMessage += `📊 Saldo médio por usuário: R$ ${(totalBalance / users.length).toFixed(2)}\n`;
         }
 
-        let sum = 0;
-        let parity = cardNumber.length % 2; // Paridade do tamanho da string base
+        // Dividir mensagem se for muito longa (limite do Telegram é ~4096 caracteres)
+        if (reportMessage.length > 4000) {
+            const messages = [];
+            let currentMessage = '';
+            const lines = reportMessage.split('\n');
 
-        for (let i = 0; i < cardNumber.length; i++) {
-            let digit = parseInt(cardNumber[i]);
-            if (i % 2 === parity) {
-                digit *= 2;
-                if (digit > 9) {
-                    digit -= 9;
+            for (const line of lines) {
+                if ((currentMessage + line + '\n').length > 4000) {
+                    messages.push(currentMessage);
+                    currentMessage = line + '\n';
+                } else {
+                    currentMessage += line + '\n';
                 }
             }
-            sum += digit;
-        }
-
-        const checkDigit = (10 - (sum % 10)) % 10;
-        return cardNumber + checkDigit;
-    }
-
-    const testCardNumber = generateLuhnNumber(prefix, length);
-
-    // Data de validade futura
-    const currentYear = new Date().getFullYear();
-    const expYear = currentYear + Math.floor(Math.random() * 5) + 1; // 1 a 5 anos no futuro
-    const expMonth = Math.floor(Math.random() * 12) + 1; // 1 a 12
-
-    // CVV (3 ou 4 dígitos)
-    const cvv = randomTypeName === 'Amex' ? Math.floor(1000 + Math.random() * 9000) : Math.floor(100 + Math.random() * 900);
-
-    return `Tipo: ${randomTypeName}, Número: ${testCardNumber}, Validade: ${String(expMonth).padStart(2, '0')}/${expYear}, CVV: ${cvv} (APENAS PARA TESTES - NÃO É UM CARTÃO REAL)`;
-}
-
-/**
- * Função para validar o formato de uma GG e simular seu status "LIVE".
- * PRIMEIRO: Valida o formato da GG.
- * SEGUNDO: Simula o status "LIVE" (requer API real para verificação verdadeira).
- * @param {string} itemType - Tipo do item ('gg' ou 'card').
- * @param {string} item - A GG ou o Card a ser verificado.
- * @returns {Promise<string>} O status ('LIVE', 'DIE', 'INVALID_FORMAT', 'ERROR').
- */
-async function checkGGStatus(itemType, item) {
-    // 1. Validação de Formato (Checksum para GGs)
-    if (itemType === 'gg') {
-        const ggPattern = /^(\d{16})\|(\d{2})\|(\d{4})\|(\d{3}) \(Validade: \d{2}\/\d{2}\/\d{4}\)$/;
-        if (!ggPattern.test(item)) {
-            return 'INVALID_FORMAT'; // Retorna que o formato está errado
-        }
-        // Se precisar de uma lógica de checksum mais complexa para a GG (ex: soma de dígitos),
-        // ela seria implementada aqui. Por enquanto, a validação regex é o checksum de formato.
-    } else if (itemType === 'card') {
-        // Para cards, a validação de Luhn é feita na geração.
-        // Se precisasse validar novamente aqui, a lógica seria adicionada.
-    }
-
-    // --- EXEMPLO CONCEITUAL DE CHAMADA A UMA API EXTERNA ---
-    // ESTA PARTE AINDA É UMA SIMULAÇÃO.
-    // PARA VERIFICAÇÃO "LIVE" REAL, VOCÊ PRECISARÁ DE UMA API REAL E LEGÍTIMA.
-    const EXTERNAL_API_URL = 'https://api.exemplo.com/check-item-status'; // URL da sua API de verificação
-    const EXTERNAL_API_KEY = 'SUA_CHAVE_DA_API'; // Chave da sua API de verificação
-
-    try {
-        // Simulação de delay de rede
-        await new Promise(resolve => setTimeout(resolve, 500)); 
-
-        // EXEMPLO 1: Usando uma API que espera um POST com o item
-        /*
-        const response = await axios.post(EXTERNAL_API_URL, {
-            type: itemType,
-            itemValue: item // O item completo, incluindo validade se a API precisar
-        }, {
-            headers: {
-                'Authorization': `Bearer ${EXTERNAL_API_KEY}`,
-                'Content-Type': 'application/json'
+            
+            if (currentMessage) {
+                messages.push(currentMessage);
             }
-        });
-        return response.data.status; // Supondo que a API retorne { status: 'LIVE'/'DIE'/'INVALID' }
-        */
 
-        // EXEMPLO 2: Usando uma API que espera um GET com o item na URL
-        /*
-        const encodedItem = encodeURIComponent(item); // Codificar o item para URL
-        const response = await axios.get(`${EXTERNAL_API_URL}?type=${itemType}&item=${encodedItem}`, {
-            headers: { 'Authorization': `Bearer ${EXTERNAL_API_KEY}` }
-        });
-        return response.data.status;
-        */
-
-        // --- MOCK ATUAL (REMOVER ESTE BLOCO EM PRODUÇÃO COM API REAL) ---
-        const randomNumber = Math.random();
-        if (itemType === 'gg') {
-            if (randomNumber < 0.7) { // 70% de chance de ser LIVE
-                return 'LIVE';
-            } else if (randomNumber < 0.9) { // 20% de chance de ser DIE
-                return 'DIE';
-            } else { // 10% de chance de ser INVÁLIDO
-                return 'INVALID';
+            // Enviar mensagens divididas
+            for (let i = 0; i < messages.length; i++) {
+                const messageToSend = i === 0 
+                    ? messages[i] 
+                    : `📊 **Relatório de Usuários (Continuação ${i + 1})** 📊\n\n${messages[i]}`;
+                
+                await bot.sendMessage(chatId, messageToSend, { parse_mode: 'Markdown' });
+                
+                // Pequeno delay entre mensagens para evitar rate limiting
+                if (i < messages.length - 1) {
+                    await new Promise(resolve => setTimeout(resolve, 500));
+                }
             }
-        } else if (itemType === 'card') {
-            if (randomNumber < 0.6) { // 60% de chance de ser LIVE
-                return 'LIVE';
-            } else { // 40% de chance de ser DIE
-                return 'DIE';
-            }
+        } else {
+            await bot.sendMessage(chatId, reportMessage, { parse_mode: 'Markdown' });
         }
-        return 'UNKNOWN'; // Tipo desconhecido
 
     } catch (error) {
-        console.error(`Erro ao tentar verificar status do item (${itemType}):`, error.message || error);
-        if (error.response) {
-            console.error('Dados do erro da API de verificação (provavelmente mock):', error.response.data);
-        }
-        return 'ERROR'; // Retorna 'ERROR' em caso de falha na comunicação ou na API
+        console.error('Erro ao gerar relatório:', error);
+        bot.sendMessage(chatId, '❌ Erro interno do servidor. Tente novamente mais tarde.');
     }
-}
-
+});
