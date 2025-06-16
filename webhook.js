@@ -8,9 +8,14 @@ require('dotenv').config();
 const DATABASE_URL = process.env.DATABASE_URL;
 const PAGSEGURO_WEBHOOK_SECRET = process.env.PAGSEGURO_WEBHOOK_SECRET;
 const PAGBANK_API_TOKEN = process.env.PAGBANK_API_TOKEN;
-const PAGBANK_EMAIL = process.env.PAGBANK_EMAIL;
+
+const WEBHOOK_URL = process.env.WEBHOOK_URL;
 const app = express();
 
+
+if (!WEBHOOK_URL) {
+    console.warn('WEBHOOK_URL não configurada. Callbacks do PagSeguro podem não funcionar corretamente.');
+}
 // Middleware para capturar o body raw (necessário para validação de assinatura)
 app.use('/webhook', express.raw({ type: 'application/json' }));
 // Para outras rotas, use JSON parser normal
@@ -151,42 +156,23 @@ syncDatabase();
 // Endpoint para receber notificações do PagSeguro
 app.post('/webhook/pagseguro', async (req, res) => {
     try {
-        // Parse do JSON do body raw
-        const data = JSON.parse(req.body.toString());
-        console.log('Webhook do PagSeguro recebido:', data);
-
-        // --- VALIDAÇÃO DO WEBHOOK (Altamente Recomendado para Segurança) ---
-        const signatureHeader = req.headers['x-pagseguro-signature'] || req.headers['x-signature'];
-
-        if (!PAGSEGURO_WEBHOOK_SECRET) {
-            console.warn('Variável PAGSEGURO_WEBHOOK_SECRET não configurada. A validação de webhook está desabilitada.');
-        } else if (signatureHeader) {
-            const isValidSignature = validatePagSeguroSignature(req.body, signatureHeader, PAGSEGURO_WEBHOOK_SECRET);
-            if (!isValidSignature) {
-                console.warn('Webhook recebido com assinatura inválida! Possível tentativa de ataque.');
-                return res.status(403).json({ error: 'Forbidden: Invalid signature' });
+        console.log('Webhook recebido:', req.body);
+        
+        // Validar a assinatura apenas se a chave secreta estiver configurada
+        const signature = req.headers['x-hub-signature'];
+        if (signature && PAGSEGURO_WEBHOOK_SECRET) {
+            const isValid = validatePagSeguroSignature(req.body, signature, PAGSEGURO_WEBHOOK_SECRET);
+            if (!isValid) {
+                console.error('Assinatura do webhook inválida');
+                return res.status(401).json({ error: 'Assinatura inválida' });
             }
-            console.log('Assinatura do webhook validada com sucesso.');
-        } else if (PAGSEGURO_WEBHOOK_SECRET) {
-            console.warn('Webhook recebido sem assinatura, mas PAGSEGURO_WEBHOOK_SECRET está configurado.');
-            return res.status(403).json({ error: 'Forbidden: Missing signature' });
-        }
-
-        // Processa diferentes tipos de eventos do PagSeguro
-        if (data.notificationCode) {
-            // Webhook de notificação tradicional do PagSeguro
-            await processPagSeguroNotification(data.notificationCode, res);
-        } else if (data.charges && data.charges.length > 0) {
-            // Webhook do PagSeguro V4 (novo formato)
-            await processPagSeguroV4Webhook(data, res);
         } else {
-            console.log('Formato de webhook não reconhecido:', data);
-            res.status(200).json({ message: 'Webhook recebido mas não processado' });
+            console.warn('Webhook recebido sem validação de assinatura - PAGSEGURO_WEBHOOK_SECRET não configurado');
         }
 
-    } catch (parseError) {
-        console.error('Erro ao fazer parse do JSON do webhook:', parseError);
-        res.status(400).json({ error: 'JSON inválido' });
+    } catch (error) {
+        console.error('Erro ao processar webhook:', error);
+        res.status(500).json({ error: 'Erro interno ao processar webhook' });
     }
 });
 
@@ -195,29 +181,30 @@ app.post('/webhook/pagseguro', async (req, res) => {
  */
 async function processPagSeguroNotification(notificationCode, res) {
     try {
-        // Consulta a API do PagSeguro para obter detalhes da transação
-        const response = await fetch(`https://ws.pagseguro.uol.com.br/v3/transactions/notifications/${notificationCode}?email=${process.env.PAGBANK_EMAIL}&token=${PAGBANK_API_TOKEN}`);
+        // Nova URL da API V4
+        const response = await fetch(`https://api.pagseguro.com/orders/${notificationCode}`, {
+            headers: {
+                'Authorization': `Bearer ${PAGBANK_API_TOKEN}`
+            }
+        });
         
         if (!response.ok) {
-            throw new Error(`Erro na API do PagSeguro: ${response.status}`);
+            throw new Error(`Erro na API do PagBank: ${response.status}`);
         }
 
-        const xmlData = await response.text();
-        console.log('Dados XML recebidos do PagSeguro:', xmlData);
+        const data = await response.json();
+        console.log('Dados recebidos do PagBank:', data);
 
-        // Aqui você precisaria fazer o parse do XML
-        // Para simplificar, vou mostrar como seria com a estrutura esperada
-        const transactionData = parseXMLTransaction(xmlData);
-        
-        if (transactionData.status === 3 || transactionData.status === 4) { // Status 3 = Paga, 4 = Disponível
-            await processPayment(transactionData, res);
+        // Processar resposta no formato V4
+        if (data.charges && data.charges.length > 0) {
+            await processPagSeguroV4Webhook(data, res);
         } else {
-            console.log(`Transação ${transactionData.code} ainda não foi paga. Status: ${transactionData.status}`);
-            res.status(200).json({ message: 'Transação não paga ainda' });
+            console.log('Formato de resposta não reconhecido:', data);
+            res.status(200).json({ message: 'Notificação recebida mas não processada' });
         }
 
     } catch (error) {
-        console.error('Erro ao processar notificação do PagSeguro:', error);
+        console.error('Erro ao processar notificação do PagBank:', error);
         res.status(500).json({ error: 'Erro ao processar notificação' });
     }
 }

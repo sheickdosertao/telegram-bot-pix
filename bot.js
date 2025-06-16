@@ -10,15 +10,35 @@ const qrcode = require('qrcode'); // Para gerar QR Codes
 const PAGBANK_API_TOKEN = process.env.PAGBANK_API_TOKEN;
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const DATABASE_URL = process.env.DATABASE_URL; // URL de conexão do PostgreSQL
+const WEBHOOK_URL = process.env.WEBHOOK_URL;
 
 
 const PAGBANK_API_URL = 'https://api.pagseguro.com/orders'; // URL da API do PagSeguro
 
 
+process.on('unhandledRejection', (error) => {
+    console.error('Erro não tratado:', error);
+});
+
+bot.on('polling_error', (error) => {
+    console.error('Erro no polling do bot:', error);
+});
+
+// Verificação da variável de ambiente PAGBANK_API_URL
+if (!PAGBANK_API_URL) {
+    console.warn('PAGBANK_API_URL não configurada, usando URL padrão');
+}
+
+// Verificação mais robusta do WEBHOOK_URL
+if (!WEBHOOK_URL || !WEBHOOK_URL.startsWith('https://')) {
+    console.error('WEBHOOK_URL inválida ou não configurada corretamente');
+    process.exit(1);
+}
+
 // Verifica se as variáveis essenciais estão definidas
-if (!TELEGRAM_BOT_TOKEN || !DATABASE_URL || !PAGBANK_API_TOKEN) {
+if (!TELEGRAM_BOT_TOKEN || !DATABASE_URL || !PAGBANK_API_TOKEN || !WEBHOOK_URL) {
     console.error('ERRO: Por favor, configure todas as variáveis de ambiente essenciais no arquivo .env ou no ambiente de deploy.');
-    console.error('Variáveis obrigatórias: TELEGRAM_BOT_TOKEN, DATABASE_URL, PAGBANK_API_TOKEN');
+    console.error('Variáveis obrigatórias: TELEGRAM_BOT_TOKEN, DATABASE_URL, PAGBANK_API_TOKEN, WEBHOOK_URL');
     process.exit(1);
 }
 
@@ -27,13 +47,13 @@ const bot = new TelegramBot(TELEGRAM_BOT_TOKEN, { polling: true });
 console.log('Bot Telegram iniciado e aguardando mensagens...');
 
 // --- Conexão PostgreSQL com Sequelize ---
-const sequelize = new Sequelize(DATABASE_URL, {
+const sequelize = new Sequelize(process.env.DATABASE_URL, {
     dialect: 'postgres',
-    logging: false, // Desabilita logs de SQL no console (true para depuração)
+    logging: false,
     dialectOptions: {
         ssl: process.env.NODE_ENV === 'production' ? {
             require: true,
-            rejectUnauthorized: false // Para Railway e outros hosts que usam SSL auto-assinado
+            rejectUnauthorized: false
         } : false
     }
 });
